@@ -1,0 +1,8 @@
+[package]
+name = "ashby-games"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ashby-core = { path = "../core" }
+rand = "0.8"
