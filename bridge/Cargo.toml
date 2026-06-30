@@ -1,0 +1,14 @@
+[package]
+name = "ashby-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ashby"
+crate-type = ["cdylib"]
+
+[dependencies]
+ashby-core = { path = "../core" }
+ashby-games = { path = "../games" }
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
