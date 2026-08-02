@@ -1,0 +1,16 @@
+# RLBot v2 bot config -- points the RLBot GUI at rlbot_agent.py.
+#
+# RLBot v2 only reads TOML bot configs (see rlbot/config.py's use of tomllib), there's
+# no .cfg format anymore -- add this file to the RLBot GUI ("Add" -> browse to this
+# file) rather than looking for an ini-style config.
+#
+# run_command is relative to this file's directory (mind/rl) -- it reaches back into
+# the project's own venv so Ashby runs with the same torch/CUDA/rlgym_sim install
+# everything else in this repo uses, not whatever `python` resolves to globally.
+
+[settings]
+name = "Ashby"
+agent_id = "yaiito/ashby"
+run_command = "../../.venv/Scripts/python.exe rlbot_agent.py"
+run_command_linux = "../../.venv/bin/python rlbot_agent.py"
+hivemind = false
