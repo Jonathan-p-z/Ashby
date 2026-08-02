@@ -6,6 +6,7 @@ ifeq ($(OS),Windows_NT)
     RM      := rmdir /s /q
     SEP     := \\
     SET_MPL := set "MPLBACKEND=Agg" &&
+    SET_WORKERS := set "NUM_WORKERS=4" &&
 else
     PYTHON  := .venv/bin/python
     PIP     := .venv/bin/pip
@@ -13,6 +14,7 @@ else
     RM      := rm -rf
     SEP     := /
     SET_MPL := MPLBACKEND=Agg
+    SET_WORKERS := NUM_WORKERS=4
 endif
 
 .PHONY: build train eval pretrain benchmark run docs setup clean help vizdoom-train vizdoom-watch vizdoom-clean vizdoom-defend vizdoom-defend-watch vizdoom-transfer vizdoom-live rl-record rl-calibrate rl-train-bc rl-train-rl rl-watch rl-clean rl-rlbot
@@ -43,7 +45,7 @@ help:
 	@echo "  rl-record      play 1v1 vs Ashby with the DualSense (visualization window included)"
 	@echo "  rl-calibrate   print live DualSense axis/button values to tune the mapping"
 	@echo "  rl-train-bc    behavioral cloning from recorded sessions -> rl_imitation.pth"
-	@echo "  rl-train-rl    autonomous RL vs a scripted bot (10000 episodes) -> rl_policy.pth"
+	@echo "  rl-train-rl    autonomous RL vs a scripted bot, 4 parallel workers -> rl_policy.pth"
 	@echo "  rl-watch       watch the trained policy play 1v1"
 	@echo "  rl-clean       delete captured recording sessions"
 	@echo "  rl-rlbot       show how to point the RLBot GUI at Ashby for a real match"
@@ -126,8 +128,8 @@ rl-train-bc:
 	@$(SET_MPL) $(PYTHON) mind/rl/imitation.py
 
 rl-train-rl:
-	@echo "Autonomous RL training vs a scripted bot (10000 episodes)..."
-	@$(SET_MPL) $(PYTHON) mind/rl/rl_train.py
+	@echo "Autonomous RL training vs a scripted bot (10000 episodes, 4 parallel workers)..."
+	@$(SET_MPL) $(SET_WORKERS) $(PYTHON) mind/rl/rl_train.py
 
 rl-watch:
 	@echo "Launching RLGym watch mode..."

@@ -63,7 +63,14 @@ class RLAgent:
         target_update_freq: int = 500,
         batch_size: int = 128,
         memory_capacity: int = 100_000,
+        device: torch.device = None,
     ):
+        # rl_train.py's worker processes force this to CPU -- RocketSim never touches
+        # the GPU anyway, and giving every worker its own CUDA context for a network
+        # this small would burn VRAM for zero benefit. The learner process is the one
+        # place that actually wants DEVICE (cuda if available).
+        self.device = device if device is not None else DEVICE
+
         self.gamma = gamma
         self.epsilon = epsilon_start
         self.epsilon_end = epsilon_end
@@ -72,13 +79,13 @@ class RLAgent:
         self.batch_size = batch_size
         self._steps = 0
 
-        self.actor = ActorNet().to(DEVICE)
-        self.actor_target = ActorNet().to(DEVICE)
-        self.critic = CriticNet().to(DEVICE)
-        self.critic_target = CriticNet().to(DEVICE)
+        self.actor = ActorNet().to(self.device)
+        self.actor_target = ActorNet().to(self.device)
+        self.critic = CriticNet().to(self.device)
+        self.critic_target = CriticNet().to(self.device)
 
         if imitation_weights and os.path.exists(imitation_weights):
-            state_dict = torch.load(imitation_weights, map_location=DEVICE, weights_only=True)
+            state_dict = torch.load(imitation_weights, map_location=self.device, weights_only=True)
             self.actor.load_state_dict(state_dict)
             print(f"Actor initialized from imitation weights: {imitation_weights}")
         else:
@@ -101,13 +108,13 @@ class RLAgent:
         if np.random.random() < self.epsilon:
             return np.random.uniform(-1.0, 1.0, size=ACTION_SIZE).astype(np.float32)
 
-        state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             return self.actor(state_t).cpu().numpy()[0]
 
     def best_action(self, state: np.ndarray) -> np.ndarray:
         """Pure exploitation -- used for evaluation and watch.py."""
-        state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             return self.actor(state_t).cpu().numpy()[0]
 
@@ -121,11 +128,11 @@ class RLAgent:
         batch = self.memory.sample(self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states_t = torch.FloatTensor(np.array(states)).to(DEVICE)
-        actions_t = torch.FloatTensor(np.array(actions)).to(DEVICE)
-        rewards_t = torch.FloatTensor(rewards).to(DEVICE)
-        next_states_t = torch.FloatTensor(np.array(next_states)).to(DEVICE)
-        dones_t = torch.FloatTensor(np.array(dones, dtype=np.float32)).to(DEVICE)
+        states_t = torch.FloatTensor(np.array(states)).to(self.device)
+        actions_t = torch.FloatTensor(np.array(actions)).to(self.device)
+        rewards_t = torch.FloatTensor(rewards).to(self.device)
+        next_states_t = torch.FloatTensor(np.array(next_states)).to(self.device)
+        dones_t = torch.FloatTensor(np.array(dones, dtype=np.float32)).to(self.device)
 
         # Critic learns to predict returns, same Bellman target as any DQN --
         # just bootstrapped off the actor's next action instead of an argmax over Q.
@@ -162,7 +169,7 @@ class RLAgent:
         torch.save(self.actor.state_dict(), path)
 
     def load_weights(self, path: str):
-        state_dict = torch.load(path, map_location=DEVICE, weights_only=True)
+        state_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.actor.load_state_dict(state_dict)
         self.actor_target.load_state_dict(state_dict)
         self.actor.eval()

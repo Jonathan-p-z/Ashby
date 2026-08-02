@@ -2,16 +2,27 @@
 
 Starts from rl_imitation.pth (if it exists) so the agent isn't relearning "which pedal is
 throttle" from scratch, then plays 1v1 against the scripted bot in env.py, fine-tuning the
-actor/critic pair from rl_agent.py on whatever reward its own play generates. No human in
-the loop from here on -- this is the part that's supposed to eventually get better than
-the demonstrations it started from.
+actor/critic pair from rl_agent.py on whatever reward its own play generates.
+
+NUM_WORKERS separate processes each run their own RocketSim instance on CPU, playing out
+1v1s in real time and shipping (state, action, reward, next_state, done) tuples back to
+this process over a Queue. This process is the only one that ever touches the GPU -- it
+owns the replay buffer, runs the actual gradient steps on the 4060, and every
+WEIGHT_SYNC_EVERY learner steps pushes the updated actor back out to the workers so their
+rollouts keep tracking the improving policy instead of freezing at whatever they started
+with. Splitting it this way is the whole point: RocketSim is single-core physics, so 4
+workers means roughly 4x the environment steps/sec feeding the same one learner.
 """
 
 import os
 import sys
+import time
+import queue
 import argparse
+import multiprocessing as mp
 
 import numpy as np
+import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,13 +35,19 @@ IMITATION_WEIGHTS = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 POLICY_WEIGHTS = os.path.join(WEIGHTS_DIR, "rl_policy.pth")
 RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "rl_training_results.png")
 
+# Ryzen 7 8845HS has 8 cores -- 4 RocketSim workers leaves headroom for the learner
+# process, matplotlib, and the OS instead of fighting them for the last core.
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 4))
+WEIGHT_SYNC_EVERY = 100  # learner steps between pushing fresh actor weights to workers
+
 N_EPISODES = 10_000
 CHECKPOINT_EVERY = 500
 REPORT_EVERY = 100
 WINDOW = 100  # rolling window for the narrative stats
+THROUGHPUT_EVERY = 5.0  # seconds between steps/sec readouts
 
 
-def _narrative(episode: int, touch_rate: float, goal_diff_avg: float, epsilon: float) -> str:
+def _narrative(episode: int, touch_rate: float, goal_diff_avg: float) -> str:
     """Grounded in what we can actually measure -- touch rate and goal differential
     against the scripted bot -- rather than claiming behaviors (aerials, dribbles) we
     have no detector for."""
@@ -48,63 +65,170 @@ def _narrative(episode: int, touch_rate: float, goal_diff_avg: float, epsilon: f
         phase = "outperforming the beginner bot -- goal difference solidly positive"
     return (
         f"Episode {episode:5d} -- touch rate {touch_rate:4.0%} | "
-        f"goal diff {goal_diff_avg:+.2f} | {phase} (e={epsilon:.2f})"
+        f"goal diff {goal_diff_avg:+.2f} | {phase}"
     )
+
+
+def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Queue,
+                  stats_queue: mp.Queue, stop_event, init_weights: str):
+    """Runs in its own process: plays 1v1 against the scripted bot forever, shipping
+    transitions out and picking up fresh actor weights whenever the learner has some.
+
+    Stays on CPU end to end -- RocketSim is single-core physics regardless, and a CUDA
+    context per worker would cost VRAM for a network this small with no upside.
+    Epsilon decays locally per worker rather than being broadcast from the learner --
+    exploration only needs to happen somewhere, it doesn't need to be perfectly
+    synchronized across 4 processes to do its job.
+    """
+    env = make_env(spawn_opponents=True)
+    agent = RLAgent(imitation_weights=init_weights, device=torch.device("cpu"))
+    print(f"Worker {worker_id} ready", flush=True)
+
+    obs, info = env.reset(return_info=True)
+    blue0, orange0 = info["state"].blue_score, info["state"].orange_score
+    ep_reward, touched = 0.0, False
+
+    while not stop_event.is_set():
+        action_agent = agent.act(np.asarray(obs[0]))
+        action_bot = scripted_bot_action(np.asarray(obs[1]))
+
+        next_obs, rewards, done, info = env.step(np.stack([action_agent, action_bot]))
+        experience_queue.put((np.asarray(obs[0]), action_agent, rewards[0], np.asarray(next_obs[0]), done))
+
+        ep_reward += rewards[0]
+        touched = touched or info["state"].players[0].ball_touched
+        obs = next_obs
+
+        if done:
+            blue1, orange1 = info["state"].blue_score, info["state"].orange_score
+            stats_queue.put((ep_reward, float(touched), (blue1 - blue0) - (orange1 - orange0)))
+            agent.decay_epsilon()
+
+            obs, info = env.reset(return_info=True)
+            blue0, orange0 = info["state"].blue_score, info["state"].orange_score
+            ep_reward, touched = 0.0, False
+
+        _apply_latest_weights(agent, weights_queue)
+
+    env.close()
+
+
+def _apply_latest_weights(agent: RLAgent, weights_queue: mp.Queue):
+    """Drains the queue instead of popping one -- if the learner pushed several updates
+    while this worker was mid-episode, only the newest one is worth loading."""
+    latest = None
+    while True:
+        try:
+            latest = weights_queue.get_nowait()
+        except queue.Empty:
+            break
+    if latest is not None:
+        agent.actor.load_state_dict(latest)
+
+
+def _broadcast_weights(agent: RLAgent, weight_queues: list):
+    """Pushed as plain CPU tensors -- workers never touch CUDA, so there's nothing to
+    convert on their end, just load_state_dict and keep playing."""
+    state_dict = {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()}
+    for q in weight_queues:
+        try:
+            q.get_nowait()  # drop whatever update the worker hasn't picked up yet
+        except queue.Empty:
+            pass
+        q.put(state_dict)
+
+
+def _spawn_workers(init_weights: str) -> tuple:
+    """Starts the worker pool and the queues it shares with the learner."""
+    experience_queue = mp.Queue(maxsize=50_000)
+    stats_queue = mp.Queue()
+    weight_queues = [mp.Queue(maxsize=1) for _ in range(NUM_WORKERS)]
+    stop_event = mp.Event()
+
+    workers = [
+        mp.Process(
+            target=_worker_loop,
+            args=(i, weight_queues[i], experience_queue, stats_queue, stop_event, init_weights),
+            daemon=True,
+        )
+        for i in range(NUM_WORKERS)
+    ]
+    for w in workers:
+        w.start()
+
+    return workers, experience_queue, stats_queue, weight_queues, stop_event
+
+
+def _shutdown_workers(workers: list, stop_event):
+    stop_event.set()
+    for w in workers:
+        w.join(timeout=5.0)
+        if w.is_alive():
+            w.terminate()
 
 
 def train():
     print("=" * 70)
     print("  Ashby x RLGym -- autonomous RL vs scripted bot")
-    print(f"  {N_EPISODES} episodes, checkpoint every {CHECKPOINT_EVERY}")
+    print(f"  {NUM_WORKERS} CPU workers -> 1 GPU learner, {N_EPISODES} episodes, checkpoint every {CHECKPOINT_EVERY}")
     print("=" * 70)
 
-    env = make_env(spawn_opponents=True)
-
     init_weights = IMITATION_WEIGHTS if os.path.exists(IMITATION_WEIGHTS) else None
-    agent = RLAgent(imitation_weights=init_weights)
+    agent = RLAgent(imitation_weights=init_weights)  # the one and only GPU copy
+
+    workers, experience_queue, stats_queue, weight_queues, stop_event = _spawn_workers(init_weights)
 
     rewards_per_ep, touches_per_ep, goal_diffs_per_ep = [], [], []
+    episode = 0
+    steps_since_sync = 0
+    throughput_steps = 0
+    throughput_clock = time.perf_counter()
 
-    for episode in range(1, N_EPISODES + 1):
-        obs, info = env.reset(return_info=True)
-        blue0, orange0 = info["state"].blue_score, info["state"].orange_score
+    try:
+        while episode < N_EPISODES:
+            try:
+                state, action, reward, next_state, done = experience_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue  # all 4 workers mid-physics-step -- nothing to learn from yet
 
-        done = False
-        ep_reward = 0.0
-        touched = False
-
-        while not done:
-            action_agent = agent.act(np.asarray(obs[0]))
-            action_bot = scripted_bot_action(np.asarray(obs[1]))
-
-            next_obs, rewards, done, info = env.step(np.stack([action_agent, action_bot]))
-
-            agent.remember(np.asarray(obs[0]), action_agent, rewards[0], np.asarray(next_obs[0]), done)
+            agent.remember(state, action, reward, next_state, done)
             agent.learn()
+            steps_since_sync += 1
+            throughput_steps += 1
 
-            touched = touched or info["state"].players[0].ball_touched
-            ep_reward += rewards[0]
-            obs = next_obs
+            if steps_since_sync >= WEIGHT_SYNC_EVERY:
+                _broadcast_weights(agent, weight_queues)
+                steps_since_sync = 0
 
-        agent.decay_epsilon()
+            while True:
+                try:
+                    ep_reward, touched, goal_diff = stats_queue.get_nowait()
+                except queue.Empty:
+                    break
+                episode += 1
+                rewards_per_ep.append(ep_reward)
+                touches_per_ep.append(touched)
+                goal_diffs_per_ep.append(goal_diff)
 
-        blue1, orange1 = info["state"].blue_score, info["state"].orange_score
-        goal_diff = (blue1 - blue0) - (orange1 - orange0)
+                if episode == 1 or episode % REPORT_EVERY == 0:
+                    touch_rate = float(np.mean(touches_per_ep[-WINDOW:]))
+                    goal_diff_avg = float(np.mean(goal_diffs_per_ep[-WINDOW:]))
+                    print(_narrative(episode, touch_rate, goal_diff_avg))
 
-        rewards_per_ep.append(ep_reward)
-        touches_per_ep.append(float(touched))
-        goal_diffs_per_ep.append(goal_diff)
+                if episode % CHECKPOINT_EVERY == 0:
+                    agent.save_weights(POLICY_WEIGHTS)
+                    print(f"  -> checkpoint saved ({episode}/{N_EPISODES}) -> {POLICY_WEIGHTS}")
 
-        if episode == 1 or episode % REPORT_EVERY == 0:
-            touch_rate = float(np.mean(touches_per_ep[-WINDOW:]))
-            goal_diff_avg = float(np.mean(goal_diffs_per_ep[-WINDOW:]))
-            print(_narrative(episode, touch_rate, goal_diff_avg, agent.epsilon))
+            elapsed = time.perf_counter() - throughput_clock
+            if elapsed >= THROUGHPUT_EVERY:
+                print(f"  [throughput] {throughput_steps / elapsed:.1f} steps/sec across {NUM_WORKERS} workers")
+                throughput_steps = 0
+                throughput_clock = time.perf_counter()
+    except KeyboardInterrupt:
+        print("\n\nStopped by user.")
+    finally:
+        _shutdown_workers(workers, stop_event)
 
-        if episode % CHECKPOINT_EVERY == 0:
-            agent.save_weights(POLICY_WEIGHTS)
-            print(f"  -> checkpoint saved ({episode}/{N_EPISODES}) -> {POLICY_WEIGHTS}")
-
-    env.close()
     agent.save_weights(POLICY_WEIGHTS)
     print(f"\nFinal policy saved -> {POLICY_WEIGHTS}")
 
@@ -147,37 +271,43 @@ def _plot(rewards: list, touches: list, goal_diffs: list):
 
 
 def smoke_test():
-    """--test: a handful of real env steps with a fresh agent, no full training run.
-    Proves the 1v1 env, the scripted bot, and the actor-critic learning step all
-    actually fit together before committing to 10,000 episodes."""
-    print("Building 1v1 env and agent...")
-    env = make_env(spawn_opponents=True)
+    """--test: spins up the real NUM_WORKERS worker pool, lets the learner consume a
+    handful of transitions and push one weight sync, then tears everything down. Proves
+    the worker/queue/learner wiring works before committing to a real N_EPISODES run."""
+    print(f"Spawning {NUM_WORKERS} workers (CPU) + 1 GPU learner...")
     init_weights = IMITATION_WEIGHTS if os.path.exists(IMITATION_WEIGHTS) else None
     agent = RLAgent(imitation_weights=init_weights, batch_size=8)
 
-    obs, info = env.reset(return_info=True)
-    assert len(obs) == 2, f"expected 2 players (1v1), got {len(obs)}"
+    workers, experience_queue, stats_queue, weight_queues, stop_event = _spawn_workers(init_weights)
 
-    for step in range(20):
-        action_agent = agent.act(np.asarray(obs[0]))
-        action_bot = scripted_bot_action(np.asarray(obs[1]))
-        next_obs, rewards, done, info = env.step(np.stack([action_agent, action_bot]))
+    try:
+        collected = 0
+        deadline = time.perf_counter() + 30.0  # rlgym_sim/RocketSim import takes a moment per worker
+        while collected < 20:
+            if time.perf_counter() > deadline:
+                raise TimeoutError(
+                    "Workers never produced experience -- check that rlgym_sim/RocketSim "
+                    "import cleanly in a worker process (run without --test for full logs)."
+                )
+            try:
+                state, action, reward, next_state, done = experience_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            agent.remember(state, action, reward, next_state, done)
+            agent.learn()
+            collected += 1
 
-        agent.remember(np.asarray(obs[0]), action_agent, rewards[0], np.asarray(next_obs[0]), done)
-        result = agent.learn()
+        _broadcast_weights(agent, weight_queues)
+        print(f"  learner: ok ({collected} transitions consumed, one weight sync pushed)")
+    finally:
+        _shutdown_workers(workers, stop_event)
 
-        obs = next_obs
-        if done:
-            obs, info = env.reset(return_info=True)
-
-    env.close()
-    print(f"  ran 20 steps of a 1v1 episode, last learn() result: {result}")
     print("rl_train.py --test PASSED")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ashby x RLGym -- autonomous RL training")
-    parser.add_argument("--test", action="store_true", help="smoke-test the 1v1 env + agent without a full run")
+    parser.add_argument("--test", action="store_true", help="smoke-test the worker pool + learner without a full run")
     args = parser.parse_args()
 
     if args.test:
