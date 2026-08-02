@@ -118,19 +118,27 @@ class AshbyObsBuilder(ObsBuilder):
 
 
 class AshbyReward(RewardFunction):
-    """Reward shaping tuned to push the agent toward the ball early, not just toward goals.
-
-    Goals are the sparsest possible signal -- an agent that only gets rewarded for scoring
-    can wander for thousands of episodes without ever stumbling into one. Touch and boost
-    rewards give it something to climb every few seconds while it's still bad at the game;
-    the idle penalty exists so "stand still in a corner" isn't a stable local optimum.
+    """Dense reward inspired by Lucy-SKG (the bot that beat Nexto) -- shaped densely
+    enough that useful signal exists on nearly every tick instead of only the rare
+    tick where a goal actually happens. Every component below is a proxy guessing at
+    what leads to a goal (closing distance, lining up a shot, sending the ball
+    goalward); GoalScored is the only one that's ground truth, which is why it
+    dwarfs everything else in magnitude.
     """
 
-    GOAL_REWARD = 1.0
-    CONCEDED_PENALTY = -1.0
-    TOUCH_REWARD = 0.1
-    BOOST_REWARD = 0.05
-    IDLE_PENALTY_PER_SEC = -0.01
+    OFFENSIVE_POTENTIAL_WEIGHT = 0.4
+    VELOCITY_BALL_TO_GOAL_WEIGHT = 0.5
+    TOUCH_ACCEL_WEIGHT = 0.3
+    DIST_WEIGHTED_ALIGN_WEIGHT = 0.2
+    GOAL_SCORED_REWARD = 10.0
+    CONCEDED_PENALTY = -10.0
+    TOUCH_BALL_REWARD = 0.1
+    BOOST_PICKUP_REWARD = 0.01
+    BOOST_WASTE_PENALTY = -0.02
+
+    BOOST_WASTE_RANGE = 500.0     # uu -- burning boost farther than this from the ball is "wasted"
+    OFFENSIVE_DIST_DECAY = 2000.0  # uu -- PlayerToBallDistance's exponential falloff
+    ALIGN_DIST_DECAY = 1000.0      # uu -- DistanceWeightedAlignment's exponential falloff
 
     def __init__(self):
         super().__init__()
@@ -139,11 +147,14 @@ class AshbyReward(RewardFunction):
         self._orange_score = 0
         self._blue_delta = 0
         self._orange_delta = 0
+        self._ball_vel_before = np.zeros(3)
+        self._prev_ball_vel = np.zeros(3)
 
     def reset(self, initial_state: GameState):
         self._blue_score = initial_state.blue_score
         self._orange_score = initial_state.orange_score
         self._last_boost = {p.car_id: p.boost_amount for p in initial_state.players}
+        self._prev_ball_vel = initial_state.ball.linear_velocity.copy()
 
     def pre_step(self, state: GameState):
         # Goals affect both players' rewards in the same tick -- compute the delta once
@@ -153,24 +164,129 @@ class AshbyReward(RewardFunction):
         self._blue_score = state.blue_score
         self._orange_score = state.orange_score
 
+        # Snapshot the ball's velocity as it stood BEFORE this tick's physics ran, so
+        # TouchBallToGoalAcceleration can measure what a touch actually did to it --
+        # "ball_touched is True" alone doesn't distinguish a full-power strike from a
+        # graze that barely nudges it, and only one of those deserves the reward.
+        self._ball_vel_before = self._prev_ball_vel
+        self._prev_ball_vel = state.ball.linear_velocity.copy()
+
+    @staticmethod
+    def _goal_pos(player: PlayerData) -> np.ndarray:
+        return np.array(
+            common_values.ORANGE_GOAL_BACK if player.team_num == common_values.BLUE_TEAM
+            else common_values.BLUE_GOAL_BACK
+        )
+
+    @staticmethod
+    def _krc(*components: float) -> float:
+        """Kinesthetic Reward Combination, the trick Lucy-SKG uses to fold several
+        normalized sub-rewards into one: multiply them (as a sign-preserving geometric
+        mean) instead of summing them, so a high score requires speed, alignment AND
+        proximity all at once. A plain sum lets "flying toward the ball at full speed
+        from completely the wrong angle" average out into a mediocre-but-positive
+        number -- a product doesn't let any one bad component hide behind the others.
+        """
+        sign = 1.0
+        magnitude = 1.0
+        for c in components:
+            if c < 0:
+                sign *= -1.0
+            magnitude *= abs(c)
+        return sign * magnitude ** (1.0 / len(components))
+
     def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
-        reward = 0.0
+        car_pos = player.car_data.position
+        car_vel = player.car_data.linear_velocity
+        ball_pos = state.ball.position
+        ball_vel = state.ball.linear_velocity
+        goal_pos = self._goal_pos(player)
 
+        to_ball = ball_pos - car_pos
+        dist_to_ball = float(np.linalg.norm(to_ball))
+        ball_to_goal = goal_pos - ball_pos
+        ball_to_goal_dist = float(np.linalg.norm(ball_to_goal))
+
+        # VelocityPlayerToBall -- how much of the car's speed is actually pointed at
+        # the ball, not just how fast it's going. Standing still scores 0, driving flat
+        # out in the wrong direction scores negative, same as a human coach would judge it.
+        vel_to_ball = (
+            float(np.dot(car_vel, to_ball / dist_to_ball)) / common_values.CAR_MAX_SPEED
+            if dist_to_ball > 1e-3 else 0.0
+        )
+
+        # AlignBallToGoal -- is the agent on the correct side of the ball to send it
+        # toward the net if it touches it right now? Raw speed and distance can't tell
+        # good positioning from bad positioning on their own -- chasing the ball from
+        # the wrong side just clears it for the opponent.
+        align = float(rl_math.cosine_similarity(ball_to_goal, to_ball)) if dist_to_ball > 1e-3 else 0.0
+
+        # PlayerToBallDistance -- exponential rather than linear falloff so the reward
+        # landscape is steep right around the ball, where positioning actually decides
+        # who gets there first, and nearly flat across the empty half of the field,
+        # where 3000uu vs 3500uu away barely matters.
+        dist_reward = float(np.exp(-dist_to_ball / self.OFFENSIVE_DIST_DECAY))
+
+        # OffensivePotential -- see _krc's docstring for why this is a product of the
+        # three components above instead of a sum.
+        offensive_potential = self._krc(vel_to_ball, align, dist_reward)
+
+        # VelocityBallToGoal -- the ball's own velocity component toward the opponent's
+        # net. This is the closest thing to "are we creating a scoring chance right
+        # now" that's measurable every tick instead of only at the goal itself.
+        vel_ball_to_goal = (
+            float(np.dot(ball_vel, ball_to_goal / ball_to_goal_dist)) / common_values.BALL_MAX_SPEED
+            if ball_to_goal_dist > 1e-3 else 0.0
+        )
+
+        # TouchBallToGoalAcceleration -- rewards the CHANGE a touch caused in the ball's
+        # velocity toward goal, not the touch itself. A touch that stops the ball dead
+        # or deflects it sideways scores ~0 here even though ball_touched is True; one
+        # that sends it rocketing goalward gets the full weight. This is what separates
+        # "made contact" from "made a good play".
+        if player.ball_touched and ball_to_goal_dist > 1e-3:
+            delta_v = ball_vel - self._ball_vel_before
+            touch_accel = float(np.dot(delta_v, ball_to_goal / ball_to_goal_dist)) / common_values.BALL_MAX_SPEED
+        else:
+            touch_accel = 0.0
+
+        # DistanceWeightedAlignment -- the same alignment signal as above, scaled down
+        # the further the agent is from the ball. Being perfectly lined up for a shot
+        # from halfway across the map isn't worth much yet; being lined up while
+        # actually within striking range is.
+        dist_weighted_align = align * float(np.exp(-dist_to_ball / self.ALIGN_DIST_DECAY))
+
+        reward = (
+            self.OFFENSIVE_POTENTIAL_WEIGHT * offensive_potential
+            + self.VELOCITY_BALL_TO_GOAL_WEIGHT * vel_ball_to_goal
+            + self.TOUCH_ACCEL_WEIGHT * touch_accel
+            + self.DIST_WEIGHTED_ALIGN_WEIGHT * dist_weighted_align
+        )
+
+        # GoalScored -- the only reward here that matches the actual win condition
+        # instead of guessing at it, so it gets by far the largest magnitude in the
+        # whole function on purpose.
         if player.team_num == common_values.BLUE_TEAM:
-            reward += self.GOAL_REWARD * self._blue_delta + self.CONCEDED_PENALTY * self._orange_delta
+            reward += self.GOAL_SCORED_REWARD * self._blue_delta + self.CONCEDED_PENALTY * self._orange_delta
         else:
-            reward += self.GOAL_REWARD * self._orange_delta + self.CONCEDED_PENALTY * self._blue_delta
+            reward += self.GOAL_SCORED_REWARD * self._orange_delta + self.CONCEDED_PENALTY * self._blue_delta
 
+        # TouchBall -- a small flat bonus for making contact at all, on top of whatever
+        # TouchBallToGoalAcceleration decided that contact was worth. Early in training,
+        # when the agent barely reaches the ball, this is what teaches "go touch it"
+        # before it's coordinated enough to make the touch itself count for much.
         if player.ball_touched:
-            reward += self.TOUCH_REWARD
-        else:
-            reward += self.IDLE_PENALTY_PER_SEC * SECONDS_PER_STEP
+            reward += self.TOUCH_BALL_REWARD
 
-        # A pickup is the only way boost goes up in this sim -- no regen, so any positive
-        # delta since last step means a pad was grabbed.
+        # BoostManagement -- boost is a finite resource shared with nobody but future-you;
+        # the only time spending it is clearly correct is when it's closing distance to
+        # the ball. Boosting in a corner 4000uu from the play burns a resource a real
+        # attack needed. Picking boost up is unconditionally good, so it's cheap to reward.
         prev_boost = self._last_boost.get(player.car_id, player.boost_amount)
         if player.boost_amount > prev_boost:
-            reward += self.BOOST_REWARD
+            reward += self.BOOST_PICKUP_REWARD
+        elif player.boost_amount < prev_boost and dist_to_ball > self.BOOST_WASTE_RANGE:
+            reward += self.BOOST_WASTE_PENALTY
         self._last_boost[player.car_id] = player.boost_amount
 
         return reward
