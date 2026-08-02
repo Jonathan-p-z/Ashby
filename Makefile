@@ -15,7 +15,7 @@ else
     SET_MPL := MPLBACKEND=Agg
 endif
 
-.PHONY: build train eval pretrain benchmark run docs setup clean help vizdoom-train vizdoom-watch vizdoom-clean vizdoom-defend vizdoom-defend-watch vizdoom-transfer vizdoom-live rl-record rl-train-bc rl-train-rl rl-watch rl-clean
+.PHONY: build train eval pretrain benchmark run docs setup clean help vizdoom-train vizdoom-watch vizdoom-clean vizdoom-defend vizdoom-defend-watch vizdoom-transfer vizdoom-live rl-record rl-calibrate rl-train-bc rl-train-rl rl-watch rl-clean rl-rlbot
 
 help:
 	@echo ""
@@ -40,11 +40,13 @@ help:
 	@echo "  vizdoom-transfer      transfer benchmark: basic -> defend"
 	@echo "  vizdoom-live          watch the agent learn live in a Doom window (3000 episodes)"
 	@echo ""
-	@echo "  rl-record      record mode -- you play Rocket League (rlgym_sim), Ashby captures"
+	@echo "  rl-record      play 1v1 vs Ashby with the DualSense (visualization window included)"
+	@echo "  rl-calibrate   print live DualSense axis/button values to tune the mapping"
 	@echo "  rl-train-bc    behavioral cloning from recorded sessions -> rl_imitation.pth"
 	@echo "  rl-train-rl    autonomous RL vs a scripted bot (10000 episodes) -> rl_policy.pth"
 	@echo "  rl-watch       watch the trained policy play 1v1"
 	@echo "  rl-clean       delete captured recording sessions"
+	@echo "  rl-rlbot       show how to point the RLBot GUI at Ashby for a real match"
 	@echo ""
 
 setup:
@@ -112,8 +114,12 @@ vizdoom-clean:
 	@$(PYTHON) -c "import os; p='mind/weights/vizdoom_basic.pth'; os.remove(p) if os.path.exists(p) else print('  nothing to clean')"
 
 rl-record:
-	@echo "Recording mode -- play now, Ashby is capturing (Ctrl+C to stop and save)..."
+	@echo "1v1 vs Ashby -- DualSense in hand, visualization window opening (Ctrl+C to stop and save)..."
 	@$(PYTHON) mind/rl/record.py
+
+rl-calibrate:
+	@echo "Calibration mode -- move the sticks/triggers, press buttons, read the raw values..."
+	@$(PYTHON) mind/rl/record.py --calibrate
 
 rl-train-bc:
 	@echo "Behavioral cloning from recorded sessions..."
@@ -130,6 +136,17 @@ rl-watch:
 rl-clean:
 	@echo "Cleaning captured RLGym sessions..."
 	@$(PYTHON) -c "import os,glob; files=glob.glob('mind/rl/data/session_*.pkl'); [os.remove(f) for f in files]; print(f'  removed {len(files)} session file(s)') if files else print('  nothing to clean')"
+
+rl-rlbot:
+	@echo "Ashby plays through the real game via the RLBot GUI, not this Makefile -- it needs"
+	@echo "RLBotServer running and Rocket League installed, neither of which make can start."
+	@echo ""
+	@echo "  1. Open the RLBot GUI (RLBotServer / RLBotGUI)."
+	@echo "  2. Add bot -> browse to mind/rl/rlbot.toml."
+	@echo "  3. Drop Ashby into a team slot, set up the rest of the match, click Start."
+	@echo ""
+	@echo "  First time, sanity-check the wrapper without the game running:"
+	@echo "    $(PYTHON) mind/rl/rlbot_agent.py --test"
 
 clean:
 	@echo "Cleaning up..."
