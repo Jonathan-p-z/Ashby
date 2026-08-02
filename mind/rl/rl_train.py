@@ -83,11 +83,15 @@ def _pool_snapshot_paths() -> list:
     return sorted(glob.glob(os.path.join(POOL_DIR, "gen_*.pth")))
 
 
-def _add_to_pool(agent: RLAgent, episode: int):
+def _add_to_pool(agent: RLAgent, episode: int, pool_version: mp.Value):
     """Snapshots the current actor into the self-play pool, evicting the oldest entry
     once there are more than POOL_SIZE. Written to a temp file then moved into place
     (os.replace is atomic on both Windows and POSIX) so a worker mid-glob never picks
     up a half-written checkpoint.
+
+    Bumping pool_version last (after the file is safely in place) is what tells
+    workers a reload is worth doing -- see _worker_loop for why they don't just
+    re-glob the pool directory every episode instead.
     """
     os.makedirs(POOL_DIR, exist_ok=True)
     path = os.path.join(POOL_DIR, f"gen_{episode:06d}.pth")
@@ -99,6 +103,8 @@ def _add_to_pool(agent: RLAgent, episode: int):
     while len(snapshots) > POOL_SIZE:
         os.remove(snapshots.pop(0))
 
+    pool_version.value += 1  # single writer (this process) -- no lock needed
+
 
 def _opponent_action(net: ImitationNet, obs: np.ndarray) -> np.ndarray:
     """Pure exploitation, same as RLAgent.best_action -- a frozen sparring partner
@@ -109,11 +115,13 @@ def _opponent_action(net: ImitationNet, obs: np.ndarray) -> np.ndarray:
 
 
 def _load_random_opponent(net: ImitationNet):
-    """Points `net` at a random snapshot from the self-play pool for the next episode
-    and returns the action function to call each step. Empty pool (the very start of
-    training, before anything has been added yet) falls back to pure random actions --
-    there's no "beginner bot" skill floor to fall back on anymore, so a blank pool
-    just means the first episodes are against noise instead of a fixed opponent.
+    """Points `net` at a random snapshot from the self-play pool and returns the action
+    function to call each step. Only called from _worker_loop when pool_version has
+    actually changed -- not every episode -- so this is the one place that ever touches
+    disk for the opponent. Empty pool (the very start of training, before anything has
+    been added yet) falls back to pure random actions -- there's no "beginner bot" skill
+    floor to fall back on anymore, so a blank pool just means the first episodes are
+    against noise instead of a fixed opponent.
     """
     snapshots = _pool_snapshot_paths()
     if snapshots:
@@ -128,7 +136,7 @@ def _load_random_opponent(net: ImitationNet):
 
 
 def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Queue,
-                  stats_queue: mp.Queue, stop_event, init_weights: str):
+                  stats_queue: mp.Queue, stop_event, init_weights: str, pool_version: mp.Value):
     """Runs in its own process: plays 1v1 self-play forever, shipping transitions out
     and picking up fresh actor weights whenever the learner has some.
 
@@ -140,7 +148,11 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
 
     The opponent is a bare ImitationNet rather than a full RLAgent -- it only ever
     needs a forward pass against a frozen snapshot, so there's no reason to carry a
-    critic, optimizers, and a replay buffer it will never touch.
+    critic, optimizers, and a replay buffer it will never touch. It's kept in memory
+    across episodes and only reloaded from disk when pool_version changes (i.e. the
+    learner actually added a new snapshot, every POOL_UPDATE_EVERY episodes) -- the
+    pool doesn't change every episode, so re-globbing mind/weights/pool/ and hitting
+    disk with torch.load every single episode was pure waste for no fresher data.
     """
     env = make_env(spawn_opponents=True)
     agent = RLAgent(imitation_weights=init_weights, device=torch.device("cpu"))
@@ -151,6 +163,7 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
     blue0, orange0 = info["state"].blue_score, info["state"].orange_score
     ep_reward, touched = 0.0, False
     opponent_action = _load_random_opponent(opponent_net)
+    last_seen_pool_version = pool_version.value
 
     while not stop_event.is_set():
         action_agent = agent.act(np.asarray(obs[0]))
@@ -171,7 +184,10 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
             obs, info = env.reset(return_info=True)
             blue0, orange0 = info["state"].blue_score, info["state"].orange_score
             ep_reward, touched = 0.0, False
-            opponent_action = _load_random_opponent(opponent_net)  # fresh sparring partner each episode
+
+            if pool_version.value != last_seen_pool_version:
+                opponent_action = _load_random_opponent(opponent_net)
+                last_seen_pool_version = pool_version.value
 
         _apply_latest_weights(agent, weights_queue)
 
@@ -204,16 +220,17 @@ def _broadcast_weights(agent: RLAgent, weight_queues: list):
 
 
 def _spawn_workers(init_weights: str) -> tuple:
-    """Starts the worker pool and the queues it shares with the learner."""
+    """Starts the worker pool and the queues/shared state it shares with the learner."""
     experience_queue = mp.Queue(maxsize=50_000)
     stats_queue = mp.Queue()
     weight_queues = [mp.Queue(maxsize=1) for _ in range(NUM_WORKERS)]
     stop_event = mp.Event()
+    pool_version = mp.Value("i", 0)  # bumped by _add_to_pool -- the "shared flag" workers poll for a reload
 
     workers = [
         mp.Process(
             target=_worker_loop,
-            args=(i, weight_queues[i], experience_queue, stats_queue, stop_event, init_weights),
+            args=(i, weight_queues[i], experience_queue, stats_queue, stop_event, init_weights, pool_version),
             daemon=True,
         )
         for i in range(NUM_WORKERS)
@@ -221,7 +238,7 @@ def _spawn_workers(init_weights: str) -> tuple:
     for w in workers:
         w.start()
 
-    return workers, experience_queue, stats_queue, weight_queues, stop_event
+    return workers, experience_queue, stats_queue, weight_queues, stop_event, pool_version
 
 
 def _shutdown_workers(workers: list, stop_event):
@@ -242,7 +259,7 @@ def train():
     init_weights = IMITATION_WEIGHTS if os.path.exists(IMITATION_WEIGHTS) else None
     agent = RLAgent(imitation_weights=init_weights)  # the one and only GPU copy
 
-    workers, experience_queue, stats_queue, weight_queues, stop_event = _spawn_workers(init_weights)
+    workers, experience_queue, stats_queue, weight_queues, stop_event, pool_version = _spawn_workers(init_weights)
 
     rewards_per_ep, touches_per_ep, goal_diffs_per_ep = [], [], []
     episode = 0
@@ -286,7 +303,7 @@ def train():
                     print(f"  -> checkpoint saved ({episode}/{N_EPISODES}) -> {POLICY_WEIGHTS}")
 
                 if episode % POOL_UPDATE_EVERY == 0:
-                    _add_to_pool(agent, episode)
+                    _add_to_pool(agent, episode, pool_version)
                     print(f"  -> self-play pool updated ({len(_pool_snapshot_paths())}/{POOL_SIZE} snapshots)")
 
             elapsed = time.perf_counter() - throughput_clock
@@ -348,7 +365,7 @@ def smoke_test():
     init_weights = IMITATION_WEIGHTS if os.path.exists(IMITATION_WEIGHTS) else None
     agent = RLAgent(imitation_weights=init_weights, batch_size=8)
 
-    workers, experience_queue, stats_queue, weight_queues, stop_event = _spawn_workers(init_weights)
+    workers, experience_queue, stats_queue, weight_queues, stop_event, pool_version = _spawn_workers(init_weights)
 
     try:
         collected = 0
@@ -369,6 +386,10 @@ def smoke_test():
 
         _broadcast_weights(agent, weight_queues)
         print(f"  learner: ok ({collected} transitions consumed, one weight sync pushed)")
+
+        _add_to_pool(agent, episode=1, pool_version=pool_version)
+        print(f"  self-play pool: ok (pool_version={pool_version.value}, workers reload on their next episode boundary)")
+        os.remove(os.path.join(POOL_DIR, "gen_000001.pth"))  # a smoke test shouldn't leave a snapshot in a real pool
     finally:
         _shutdown_workers(workers, stop_event)
 
