@@ -56,6 +56,10 @@ REPORT_EVERY = 100
 WINDOW = 100  # rolling window for the narrative stats
 THROUGHPUT_EVERY = 5.0  # seconds between steps/sec readouts
 
+PLOT_EVERY = 500   # episodes between regenerating rl_training_results.png mid-run
+PLOT_WINDOW = 50    # rolling window for the plot specifically -- narrower than WINDOW
+                    # so the graph reacts faster than the console narrative does
+
 
 def _narrative(episode: int, touch_rate: float, goal_diff_avg: float) -> str:
     """Grounded in what we can actually measure -- touch rate and goal differential
@@ -161,7 +165,7 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
 
     obs, info = env.reset(return_info=True)
     blue0, orange0 = info["state"].blue_score, info["state"].orange_score
-    ep_reward, touched = 0.0, False
+    touched = False
     opponent_action = _load_random_opponent(opponent_net)
     last_seen_pool_version = pool_version.value
 
@@ -172,18 +176,17 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
         next_obs, rewards, done, info = env.step(np.stack([action_agent, action_bot]))
         experience_queue.put((np.asarray(obs[0]), action_agent, rewards[0], np.asarray(next_obs[0]), done))
 
-        ep_reward += rewards[0]
         touched = touched or info["state"].players[0].ball_touched
         obs = next_obs
 
         if done:
             blue1, orange1 = info["state"].blue_score, info["state"].orange_score
-            stats_queue.put((ep_reward, float(touched), (blue1 - blue0) - (orange1 - orange0)))
+            stats_queue.put((float(touched), (blue1 - blue0) - (orange1 - orange0)))
             agent.decay_epsilon()
 
             obs, info = env.reset(return_info=True)
             blue0, orange0 = info["state"].blue_score, info["state"].orange_score
-            ep_reward, touched = 0.0, False
+            touched = False
 
             if pool_version.value != last_seen_pool_version:
                 opponent_action = _load_random_opponent(opponent_net)
@@ -261,7 +264,7 @@ def train():
 
     workers, experience_queue, stats_queue, weight_queues, stop_event, pool_version = _spawn_workers(init_weights)
 
-    rewards_per_ep, touches_per_ep, goal_diffs_per_ep = [], [], []
+    touches_per_ep, goal_diffs_per_ep = [], []
     episode = 0
     steps_since_sync = 0
     throughput_steps = 0
@@ -285,11 +288,10 @@ def train():
 
             while True:
                 try:
-                    ep_reward, touched, goal_diff = stats_queue.get_nowait()
+                    touched, goal_diff = stats_queue.get_nowait()
                 except queue.Empty:
                     break
                 episode += 1
-                rewards_per_ep.append(ep_reward)
                 touches_per_ep.append(touched)
                 goal_diffs_per_ep.append(goal_diff)
 
@@ -306,6 +308,10 @@ def train():
                     _add_to_pool(agent, episode, pool_version)
                     print(f"  -> self-play pool updated ({len(_pool_snapshot_paths())}/{POOL_SIZE} snapshots)")
 
+                if episode % PLOT_EVERY == 0:
+                    _plot(touches_per_ep, goal_diffs_per_ep)
+                    print(f"  -> plot updated ({episode}/{N_EPISODES}) -> {RESULTS_PATH}")
+
             elapsed = time.perf_counter() - throughput_clock
             if elapsed >= THROUGHPUT_EVERY:
                 print(f"  [throughput] {throughput_steps / elapsed:.1f} steps/sec across {NUM_WORKERS} workers")
@@ -319,38 +325,35 @@ def train():
     agent.save_weights(POLICY_WEIGHTS)
     print(f"\nFinal policy saved -> {POLICY_WEIGHTS}")
 
-    _plot(rewards_per_ep, touches_per_ep, goal_diffs_per_ep)
+    _plot(touches_per_ep, goal_diffs_per_ep)
     print(f"Plot saved         -> {RESULTS_PATH}")
 
 
-def _plot(rewards: list, touches: list, goal_diffs: list):
-    n = len(rewards)
-    w = min(WINDOW, n)
+def _plot(touches: list, goal_diffs: list):
+    """Two subplots, not three -- reward is what the learner optimizes, but touch rate
+    and goal diff are what's actually legible at a glance about whether training is
+    going anywhere, so those are the two numbers worth checking in on mid-run.
+    """
+    n = len(touches)
+    w = min(PLOT_WINDOW, n)
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7))
     fig.suptitle("Ashby x RLGym -- autonomous RL, self-play vs its own history", fontsize=13)
 
-    ax1.plot(rewards, alpha=0.2, color="steelblue")
     if w > 1:
-        ax1.plot(range(w, n + 1), np.convolve(rewards, np.ones(w) / w, mode="valid"), color="steelblue")
-    ax1.set_ylabel("Episode reward")
-    ax1.set_title("Reward over time")
+        ax1.plot(range(w, n + 1), np.convolve(touches, np.ones(w) / w, mode="valid"), color="tomato")
+    ax1.set_ylabel(f"Touch rate ({w}-ep avg)")
+    ax1.set_ylim(0, 1)
+    ax1.set_title("Ball touch rate")
     ax1.grid(alpha=0.3)
 
     if w > 1:
-        ax2.plot(range(w, n + 1), np.convolve(touches, np.ones(w) / w, mode="valid"), color="tomato")
-    ax2.set_ylabel(f"Touch rate ({w}-ep avg)")
-    ax2.set_ylim(0, 1)
-    ax2.set_title("Ball touch rate")
+        ax2.plot(range(w, n + 1), np.convolve(goal_diffs, np.ones(w) / w, mode="valid"), color="seagreen")
+    ax2.axhline(0, linestyle="--", color="gray", alpha=0.5)
+    ax2.set_ylabel(f"Goal diff ({w}-ep avg)")
+    ax2.set_xlabel("Episode")
+    ax2.set_title("Goal differential vs self-play pool")
     ax2.grid(alpha=0.3)
-
-    if w > 1:
-        ax3.plot(range(w, n + 1), np.convolve(goal_diffs, np.ones(w) / w, mode="valid"), color="seagreen")
-    ax3.axhline(0, linestyle="--", color="gray", alpha=0.5)
-    ax3.set_ylabel(f"Goal diff ({w}-ep avg)")
-    ax3.set_xlabel("Episode")
-    ax3.set_title("Goal differential vs self-play pool")
-    ax3.grid(alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(RESULTS_PATH, dpi=120)
