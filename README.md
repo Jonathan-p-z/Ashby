@@ -56,6 +56,8 @@ The negative results are just as interesting. Transfer hurts on environments wit
 
 All environments share the same interface: `reset() -> State`, `step(action) -> (State, Reward, done)`.
 
+![Training results](mind/training_results.png)
+
 ---
 
 ## Transfer learning results
@@ -79,6 +81,30 @@ Pretrain one agent sequentially on all five environments, then benchmark: scratc
 **ResourceHunter (0)** — needs ~5000 episodes in the full pipeline. Pretrain allocates 4000 and the task is hard enough that neither agent converges in 2500.
 
 See [docs/transfer_learning.md](docs/transfer_learning.md) for the full analysis.
+
+![Transfer benchmark](mind/transfer_benchmark.png)
+
+---
+
+## ViZDoom
+
+Beyond simulated environments, Ashby trains on ViZDoom — a real FPS game.
+Two scenarios validated, both with visual transfer benchmarks.
+
+| Scenario | Episodes | Result |
+|---|---|---|
+| basic | 1000 | 100% kill rate |
+| defend_the_center | 2000 | 38 kills / 10 episodes |
+
+Transfer basic → defend_the_center: converges **3x faster** than scratch.
+
+```bash
+make vizdoom-train        # headless training, generates vizdoom_results.png
+make vizdoom-watch        # watch the agent play in a real Doom window
+make vizdoom-defend       # train on defend_the_center
+make vizdoom-defend-watch # watch defend_the_center agent play
+make vizdoom-transfer     # benchmark scratch vs transfer between scenarios
+```
 
 ---
 
