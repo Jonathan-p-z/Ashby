@@ -1,8 +1,11 @@
 """Autonomous RL -- Ashby keeps playing after the human stops watching.
 
 Starts from rl_imitation.pth (if it exists) so the agent isn't relearning "which pedal is
-throttle" from scratch, then plays 1v1 against the scripted bot in env.py, fine-tuning the
-actor/critic pair from rl_agent.py on whatever reward its own play generates.
+throttle" from scratch, then plays 1v1 self-play, fine-tuning the actor/critic pair from
+rl_agent.py on whatever reward its own play generates. The opponent every worker faces is
+a random past snapshot of the same policy pulled from mind/weights/pool/, not a fixed
+scripted bot -- a static opponent stops teaching anything the moment the agent gets better
+than it, while a pool of its own recent history keeps raising the bar as training goes.
 
 NUM_WORKERS separate processes each run their own RocketSim instance on CPU, playing out
 1v1s in real time and shipping (state, action, reward, next_state, done) tuples back to
@@ -17,7 +20,9 @@ workers means roughly 4x the environment steps/sec feeding the same one learner.
 import os
 import sys
 import time
+import glob
 import queue
+import random
 import argparse
 import multiprocessing as mp
 
@@ -28,12 +33,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(__file__))
-from env import make_env, scripted_bot_action, WEIGHTS_DIR
+from env import make_env, ACTION_SIZE, WEIGHTS_DIR
 from rl_agent import RLAgent
+from imitation import ImitationNet
 
 IMITATION_WEIGHTS = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 POLICY_WEIGHTS = os.path.join(WEIGHTS_DIR, "rl_policy.pth")
 RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "rl_training_results.png")
+
+POOL_DIR = os.path.join(WEIGHTS_DIR, "pool")  # self-play opponent snapshots live here
+POOL_SIZE = 5           # oldest snapshot gets evicted once a 6th one is added
+POOL_UPDATE_EVERY = 500  # episodes between adding the current policy to the pool
 
 # Ryzen 7 8845HS has 8 cores -- 4 RocketSim workers leaves headroom for the learner
 # process, matplotlib, and the OS instead of fighting them for the last core.
@@ -49,8 +59,8 @@ THROUGHPUT_EVERY = 5.0  # seconds between steps/sec readouts
 
 def _narrative(episode: int, touch_rate: float, goal_diff_avg: float) -> str:
     """Grounded in what we can actually measure -- touch rate and goal differential
-    against the scripted bot -- rather than claiming behaviors (aerials, dribbles) we
-    have no detector for."""
+    against whichever pool snapshot each episode happened to be played against --
+    rather than claiming behaviors (aerials, dribbles) we have no detector for."""
     if episode <= 100:
         phase = "mostly random motion, any touch is a happy accident"
     elif touch_rate < 0.3:
@@ -60,37 +70,91 @@ def _narrative(episode: int, touch_rate: float, goal_diff_avg: float) -> str:
     elif goal_diff_avg <= 0.0:
         phase = "touching the ball reliably, not converting to goals yet"
     elif goal_diff_avg < 0.5:
-        phase = "trading goals roughly evenly with the scripted bot"
+        phase = "trading goals roughly evenly with its own recent history"
     else:
-        phase = "outperforming the beginner bot -- goal difference solidly positive"
+        phase = "outperforming its own past selves -- goal difference solidly positive"
     return (
         f"Episode {episode:5d} -- touch rate {touch_rate:4.0%} | "
         f"goal diff {goal_diff_avg:+.2f} | {phase}"
     )
 
 
+def _pool_snapshot_paths() -> list:
+    return sorted(glob.glob(os.path.join(POOL_DIR, "gen_*.pth")))
+
+
+def _add_to_pool(agent: RLAgent, episode: int):
+    """Snapshots the current actor into the self-play pool, evicting the oldest entry
+    once there are more than POOL_SIZE. Written to a temp file then moved into place
+    (os.replace is atomic on both Windows and POSIX) so a worker mid-glob never picks
+    up a half-written checkpoint.
+    """
+    os.makedirs(POOL_DIR, exist_ok=True)
+    path = os.path.join(POOL_DIR, f"gen_{episode:06d}.pth")
+    tmp_path = path + ".tmp"
+    torch.save({k: v.detach().cpu() for k, v in agent.actor.state_dict().items()}, tmp_path)
+    os.replace(tmp_path, path)
+
+    snapshots = _pool_snapshot_paths()
+    while len(snapshots) > POOL_SIZE:
+        os.remove(snapshots.pop(0))
+
+
+def _opponent_action(net: ImitationNet, obs: np.ndarray) -> np.ndarray:
+    """Pure exploitation, same as RLAgent.best_action -- a frozen sparring partner
+    should play its snapshot as well as it can, not explore on top of it."""
+    state_t = torch.FloatTensor(obs).unsqueeze(0)
+    with torch.no_grad():
+        return net(state_t).cpu().numpy()[0]
+
+
+def _load_random_opponent(net: ImitationNet):
+    """Points `net` at a random snapshot from the self-play pool for the next episode
+    and returns the action function to call each step. Empty pool (the very start of
+    training, before anything has been added yet) falls back to pure random actions --
+    there's no "beginner bot" skill floor to fall back on anymore, so a blank pool
+    just means the first episodes are against noise instead of a fixed opponent.
+    """
+    snapshots = _pool_snapshot_paths()
+    if snapshots:
+        path = random.choice(snapshots)
+        try:
+            net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+            return lambda obs: _opponent_action(net, obs)
+        except FileNotFoundError:
+            pass  # pool eviction beat us to it -- fall through to random actions this episode
+
+    return lambda obs: np.random.uniform(-1.0, 1.0, size=ACTION_SIZE).astype(np.float32)
+
+
 def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Queue,
                   stats_queue: mp.Queue, stop_event, init_weights: str):
-    """Runs in its own process: plays 1v1 against the scripted bot forever, shipping
-    transitions out and picking up fresh actor weights whenever the learner has some.
+    """Runs in its own process: plays 1v1 self-play forever, shipping transitions out
+    and picking up fresh actor weights whenever the learner has some.
 
     Stays on CPU end to end -- RocketSim is single-core physics regardless, and a CUDA
     context per worker would cost VRAM for a network this small with no upside.
     Epsilon decays locally per worker rather than being broadcast from the learner --
     exploration only needs to happen somewhere, it doesn't need to be perfectly
     synchronized across 4 processes to do its job.
+
+    The opponent is a bare ImitationNet rather than a full RLAgent -- it only ever
+    needs a forward pass against a frozen snapshot, so there's no reason to carry a
+    critic, optimizers, and a replay buffer it will never touch.
     """
     env = make_env(spawn_opponents=True)
     agent = RLAgent(imitation_weights=init_weights, device=torch.device("cpu"))
+    opponent_net = ImitationNet().to(torch.device("cpu"))
     print(f"Worker {worker_id} ready", flush=True)
 
     obs, info = env.reset(return_info=True)
     blue0, orange0 = info["state"].blue_score, info["state"].orange_score
     ep_reward, touched = 0.0, False
+    opponent_action = _load_random_opponent(opponent_net)
 
     while not stop_event.is_set():
         action_agent = agent.act(np.asarray(obs[0]))
-        action_bot = scripted_bot_action(np.asarray(obs[1]))
+        action_bot = opponent_action(np.asarray(obs[1]))
 
         next_obs, rewards, done, info = env.step(np.stack([action_agent, action_bot]))
         experience_queue.put((np.asarray(obs[0]), action_agent, rewards[0], np.asarray(next_obs[0]), done))
@@ -107,6 +171,7 @@ def _worker_loop(worker_id: int, weights_queue: mp.Queue, experience_queue: mp.Q
             obs, info = env.reset(return_info=True)
             blue0, orange0 = info["state"].blue_score, info["state"].orange_score
             ep_reward, touched = 0.0, False
+            opponent_action = _load_random_opponent(opponent_net)  # fresh sparring partner each episode
 
         _apply_latest_weights(agent, weights_queue)
 
@@ -169,8 +234,9 @@ def _shutdown_workers(workers: list, stop_event):
 
 def train():
     print("=" * 70)
-    print("  Ashby x RLGym -- autonomous RL vs scripted bot")
+    print("  Ashby x RLGym -- autonomous RL, self-play vs its own history")
     print(f"  {NUM_WORKERS} CPU workers -> 1 GPU learner, {N_EPISODES} episodes, checkpoint every {CHECKPOINT_EVERY}")
+    print(f"  self-play pool: {POOL_SIZE} snapshots, refreshed every {POOL_UPDATE_EVERY} episodes -> {POOL_DIR}")
     print("=" * 70)
 
     init_weights = IMITATION_WEIGHTS if os.path.exists(IMITATION_WEIGHTS) else None
@@ -219,6 +285,10 @@ def train():
                     agent.save_weights(POLICY_WEIGHTS)
                     print(f"  -> checkpoint saved ({episode}/{N_EPISODES}) -> {POLICY_WEIGHTS}")
 
+                if episode % POOL_UPDATE_EVERY == 0:
+                    _add_to_pool(agent, episode)
+                    print(f"  -> self-play pool updated ({len(_pool_snapshot_paths())}/{POOL_SIZE} snapshots)")
+
             elapsed = time.perf_counter() - throughput_clock
             if elapsed >= THROUGHPUT_EVERY:
                 print(f"  [throughput] {throughput_steps / elapsed:.1f} steps/sec across {NUM_WORKERS} workers")
@@ -241,7 +311,7 @@ def _plot(rewards: list, touches: list, goal_diffs: list):
     w = min(WINDOW, n)
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 10))
-    fig.suptitle("Ashby x RLGym -- autonomous RL vs scripted bot", fontsize=13)
+    fig.suptitle("Ashby x RLGym -- autonomous RL, self-play vs its own history", fontsize=13)
 
     ax1.plot(rewards, alpha=0.2, color="steelblue")
     if w > 1:
@@ -262,7 +332,7 @@ def _plot(rewards: list, touches: list, goal_diffs: list):
     ax3.axhline(0, linestyle="--", color="gray", alpha=0.5)
     ax3.set_ylabel(f"Goal diff ({w}-ep avg)")
     ax3.set_xlabel("Episode")
-    ax3.set_title("Goal differential vs scripted bot")
+    ax3.set_title("Goal differential vs self-play pool")
     ax3.grid(alpha=0.3)
 
     plt.tight_layout()
