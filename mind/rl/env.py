@@ -12,13 +12,20 @@ import torch
 import gym.spaces
 
 import rlgym_sim
+from numpy import random as rand
 from rlgym_sim.utils import common_values
 from rlgym_sim.utils import math as rl_math
 from rlgym_sim.utils.gamestates import GameState, PlayerData
 from rlgym_sim.utils.obs_builders import ObsBuilder
 from rlgym_sim.utils.reward_functions import RewardFunction
 from rlgym_sim.utils.action_parsers import ContinuousAction
+from rlgym_sim.utils.state_setters import StateSetter, StateWrapper
 from rlgym_sim.utils.terminal_conditions.common_conditions import TimeoutCondition, GoalScoredCondition
+
+# Same field-extent constants rlgym_sim's own RandomState uses for car spawn spread.
+X_MAX = 7000
+Y_MAX = 9000
+YAW_MAX = np.pi
 
 def _ensure_rocketsim_assets():
     """RocketSim needs its arena collision meshes on disk before it can build an Arena.
@@ -292,16 +299,49 @@ class AshbyReward(RewardFunction):
         return reward
 
 
-def make_env(spawn_opponents: bool = False):
-    """Builds an rlgym_sim Gym env wired to Ashby's obs/reward/action conventions.
+class BallNearCarStateSetter(StateSetter):
+    """Spawns the ball 300-800uu from a car instead of anywhere on the field.
 
-    spawn_opponents=False -> one car, empty field. Used for recording and imitation
-    replay, where we only care about a single human-controlled car.
-
-    spawn_opponents=True -> two cars, 1v1. Used for autonomous RL, where index 0 is
-    always the learning agent and index 1 is whatever opponent rl_train/watch decide
-    to drive (currently the scripted bot below).
+    Self-play with a fully random ball (RandomState) let both agents converge on
+    "stand still" -- with the ball equally likely to spawn anywhere on a 7000x9000uu
+    field, most episodes start with several seconds of nobody near it, so idling
+    stopped being distinguishable from chasing. Guaranteeing the ball starts within
+    lunging distance forces every episode to open with a contest for it.
     """
+
+    MIN_DIST = 300.0
+    MAX_DIST = 800.0
+
+    def reset(self, state_wrapper: StateWrapper):
+        for car in state_wrapper.cars:
+            car.set_pos(
+                rand.random() * X_MAX - X_MAX / 2,
+                rand.random() * Y_MAX - Y_MAX / 2,
+                17,
+            )
+            car.set_rot(pitch=0, yaw=rand.random() * YAW_MAX - YAW_MAX / 2, roll=0)
+            car.set_lin_vel(0, 0, 0)
+            car.set_ang_vel(0, 0, 0)
+            car.boost = rand.random()
+
+        anchor = state_wrapper.cars[0]
+
+        dist = rand.random() * (self.MAX_DIST - self.MIN_DIST) + self.MIN_DIST
+        angle = rand.random() * 2 * np.pi
+        ball_x = anchor.position[0] + dist * np.cos(angle)
+        ball_y = anchor.position[1] + dist * np.sin(angle)
+
+        # Clamp inside the field so a car spawning near a wall can't push the ball
+        # through it -- BALL_RADIUS keeps the ball's surface off the wall/floor too.
+        ball_x = float(np.clip(ball_x, -X_MAX / 2 + common_values.BALL_RADIUS, X_MAX / 2 - common_values.BALL_RADIUS))
+        ball_y = float(np.clip(ball_y, -Y_MAX / 2 + common_values.BALL_RADIUS, Y_MAX / 2 - common_values.BALL_RADIUS))
+
+        state_wrapper.ball.set_pos(ball_x, ball_y, common_values.BALL_RADIUS)
+        state_wrapper.ball.set_lin_vel(0, 0, 0)
+        state_wrapper.ball.set_ang_vel(0, 0, 0)
+
+
+def make_env(spawn_opponents: bool = False):
     return rlgym_sim.make(
         tick_skip=TICK_SKIP,
         spawn_opponents=spawn_opponents,
@@ -310,6 +350,7 @@ def make_env(spawn_opponents: bool = False):
         reward_fn=AshbyReward(),
         obs_builder=AshbyObsBuilder(),
         action_parser=ContinuousAction(),
+        state_setter=BallNearCarStateSetter(),
     )
 
 
