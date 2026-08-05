@@ -17,7 +17,7 @@ else
     SET_WORKERS := NUM_WORKERS=4
 endif
 
-.PHONY: build train eval pretrain benchmark run docs setup clean help vizdoom-train vizdoom-watch vizdoom-clean vizdoom-defend vizdoom-defend-watch vizdoom-transfer vizdoom-live rl-record rl-calibrate rl-train-bc rl-train-rl rl-watch rl-clean rl-rlbot
+.PHONY: build train eval pretrain benchmark run docs setup clean help vizdoom-train vizdoom-watch vizdoom-clean vizdoom-defend vizdoom-defend-watch vizdoom-transfer vizdoom-live rl-record rl-calibrate rl-train-bc rl-train-rl rl-train-ppo rl-watch rl-clean rl-rlbot rl-download rl-parse
 
 help:
 	@echo ""
@@ -45,10 +45,13 @@ help:
 	@echo "  rl-record      play 1v1 vs Ashby with the DualSense (visualization window included)"
 	@echo "  rl-calibrate   print live DualSense axis/button values to tune the mapping"
 	@echo "  rl-train-bc    behavioral cloning from recorded sessions -> rl_imitation.pth"
-	@echo "  rl-train-rl    autonomous RL vs a scripted bot, 4 parallel workers -> rl_policy.pth"
+	@echo "  rl-train-rl    autonomous RL vs a scripted bot, 6 parallel workers -> rl_policy.pth"
+	@echo "  rl-train-ppo   PPO fine-tuning via rlgym-ppo, 4 workers, 100000 steps -> mind/weights/ppo/"
 	@echo "  rl-watch       watch the trained policy play 1v1"
 	@echo "  rl-clean       delete captured recording sessions"
 	@echo "  rl-rlbot       show how to point the RLBot GUI at Ashby for a real match"
+	@echo "  rl-download    download ranked 1v1 replays from ballchasing.com (needs BALLCHASING_TOKEN)"
+	@echo "  rl-parse       parse downloaded replays into dataset_replays.pkl for imitation learning"
 	@echo ""
 
 setup:
@@ -128,8 +131,12 @@ rl-train-bc:
 	@$(SET_MPL) $(PYTHON) mind/rl/imitation.py
 
 rl-train-rl:
-	@echo "Autonomous RL training vs a scripted bot (10000 episodes, 4 parallel workers)..."
+	@echo "Autonomous RL training vs a scripted bot (100000 episodes, 6 parallel workers)..."
 	@$(SET_MPL) $(SET_WORKERS) $(PYTHON) mind/rl/rl_train.py
+
+rl-train-ppo:
+	@echo "PPO fine-tuning via rlgym-ppo (4 workers, 100000 steps)..."
+	@$(SET_MPL) $(PYTHON) mind/rl/ppo_train.py
 
 rl-watch:
 	@echo "Launching RLGym watch mode..."
@@ -138,6 +145,14 @@ rl-watch:
 rl-clean:
 	@echo "Cleaning captured RLGym sessions..."
 	@$(PYTHON) -c "import os,glob; files=glob.glob('mind/rl/data/session_*.pkl'); [os.remove(f) for f in files]; print(f'  removed {len(files)} session file(s)') if files else print('  nothing to clean')"
+
+rl-download:
+	@echo "Downloading ranked 1v1 replays from ballchasing.com (needs BALLCHASING_TOKEN set)..."
+	@$(PYTHON) mind/rl/download_replays.py
+
+rl-parse:
+	@echo "Parsing downloaded replays into a behavioral-cloning dataset..."
+	@$(PYTHON) mind/rl/parse_replays.py
 
 rl-rlbot:
 	@echo "Ashby plays through the real game via the RLBot GUI, not this Makefile -- it needs"
