@@ -342,6 +342,8 @@ class BallNearCarStateSetter(StateSetter):
 
 
 def make_env(spawn_opponents: bool = False):
+    from rlgym_sim.utils.state_setters import RandomState
+
     return rlgym_sim.make(
         tick_skip=TICK_SKIP,
         spawn_opponents=spawn_opponents,
@@ -350,7 +352,11 @@ def make_env(spawn_opponents: bool = False):
         reward_fn=AshbyReward(),
         obs_builder=AshbyObsBuilder(),
         action_parser=ContinuousAction(),
-        state_setter=BallNearCarStateSetter(),
+        state_setter=RandomState(
+            ball_rand_speed=True,
+            cars_rand_speed=True,
+            cars_on_ground=True,
+        ),
     )
 
 
