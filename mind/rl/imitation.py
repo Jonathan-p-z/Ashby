@@ -1,10 +1,14 @@
-"""Behavioral cloning -- Ashby learns to copy whatever got recorded by record.py.
+"""Behavioral cloning -- Ashby learns to copy ranked humans from parsed replays.
 
 No reward function, no exploration, just regression: given a state, predict the action
 a human produced in that state. This is deliberately the dumbest possible way to bootstrap
 a policy, and that's the point -- it gets the agent from "outputs random noise" to "roughly
 knows which way to drive" in minutes instead of the thousands of episodes raw RL would need
 to stumble into the same behavior by accident. rl_agent.py picks up from here.
+
+Trains on dataset_replays.pkl (parse_replays.py's output from downloaded ballchasing
+replays) rather than record.py's hand-played session_*.pkl files -- same 18D state / 8D
+action layout either way, just orders of magnitude more frames than one person can play.
 """
 
 import os
@@ -21,15 +25,19 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import STATE_SIZE, ACTION_SIZE, DEVICE, WEIGHTS_DIR
-from dataset import make_dataloaders
+from dataset import make_replay_dataloaders
+from parse_replays import DATASET_PATH
 
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "rl_imitation_results.png")
 
-N_EPOCHS = 100
+N_EPOCHS = 3  # dataset_replays.pkl runs ~40M frames -- a handful of passes already
+              # sees far more (state, action) pairs than 100 epochs of a hand-played
+              # session ever would; more than that mostly just burns GPU time.
 BATCH_SIZE = 256
 LEARNING_RATE = 0.001
-REPORT_EVERY = 10
+REPORT_EVERY = 1  # only 3 epochs total now -- report every one of them
+LOSS_REPORT_STEPS = 1000
 
 
 class ImitationNet(nn.Module):
@@ -75,12 +83,12 @@ def _run_epoch(model, loader, criterion, optimizer=None) -> float:
 
 def train():
     print("=" * 65)
-    print("  Ashby x RLGym -- behavioral cloning")
-    print(f"  Device: {DEVICE}")
+    print("  Ashby x RLGym -- behavioral cloning from ranked replays")
+    print(f"  Device: {DEVICE}" + (f" ({torch.cuda.get_device_name(0)})" if DEVICE.type == "cuda" else ""))
     print("=" * 65)
 
-    print("\nLoading recorded sessions...")
-    train_loader, val_loader = make_dataloaders(batch_size=BATCH_SIZE)
+    print("\nLoading parsed replay dataset...")
+    train_loader, val_loader = make_replay_dataloaders(DATASET_PATH, batch_size=BATCH_SIZE)
 
     model = ImitationNet().to(DEVICE)
     criterion = nn.MSELoss()
@@ -89,8 +97,27 @@ def train():
     train_losses, val_losses = [], []
     print(f"\nTraining for {N_EPOCHS} epochs...")
 
+    step = 0
     for epoch in range(1, N_EPOCHS + 1):
-        train_loss = _run_epoch(model, train_loader, criterion, optimizer)
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for states, actions in train_loader:
+            states, actions = states.to(DEVICE), actions.to(DEVICE)
+
+            optimizer.zero_grad()
+            preds = model(states)
+            loss = criterion(preds, actions)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+            step += 1
+            if step % LOSS_REPORT_STEPS == 0:
+                print(f"  step {step:7d}  loss={loss.item():.5f}")
+
+        train_loss = epoch_loss / max(n_batches, 1)
         val_loss = _run_epoch(model, val_loader, criterion)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
