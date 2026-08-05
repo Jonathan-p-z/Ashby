@@ -80,3 +80,36 @@ def make_dataloaders(data_dir: str = DATA_DIR, batch_size: int = 256, val_split:
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader
+
+
+def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0):
+    """Same split logic as load_datasets, but for parse_replays.py's single
+    consolidated dataset_replays.pkl instead of many session_*.pkl files --
+    replay states already go through AshbyObsBuilder's own scaling (see
+    parse_replays.py), so the same CLIP_RANGE outlier guard applies as-is."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No dataset at {path} -- run `make rl-parse` (or parse_replays.py "
+            "directly) to build it from downloaded replays first."
+        )
+
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    states = np.clip(data["states"].astype(np.float32), -CLIP_RANGE, CLIP_RANGE)
+    actions = data["actions"].astype(np.float32)
+
+    full = ImitationDataset(states, actions)
+    n_val = max(1, int(len(full) * val_split))
+    n_train = len(full) - n_val
+
+    generator = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(full, [n_train, n_val], generator=generator)
+    print(f"  total frames: {len(full)} from {data.get('n_replays', '?')} replay(s)  (train {n_train} / val {n_val})")
+    return train_set, val_set
+
+
+def make_replay_dataloaders(path: str, batch_size: int = 256, val_split: float = 0.2, seed: int = 0):
+    train_set, val_set = load_replay_dataset(path, val_split, seed)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
