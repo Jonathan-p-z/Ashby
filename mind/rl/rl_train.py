@@ -50,7 +50,7 @@ POOL_UPDATE_EVERY = 500  # episodes between adding the current policy to the poo
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 4))
 WEIGHT_SYNC_EVERY = 100  # learner steps between pushing fresh actor weights to workers
 
-N_EPISODES = 10_000
+N_EPISODES = 100_000
 CHECKPOINT_EVERY = 500
 REPORT_EVERY = 100
 WINDOW = 100  # rolling window for the narrative stats
