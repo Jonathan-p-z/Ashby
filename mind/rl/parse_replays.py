@@ -36,6 +36,7 @@ import os
 import glob
 import pickle
 import argparse
+import multiprocessing
 
 import numpy as np
 import boxcars_py
@@ -46,6 +47,9 @@ from env import STATE_SIZE, ACTION_SIZE, POS_COEF, VEL_COEF, common_values
 
 REPLAYS_DIR = os.path.join(os.path.dirname(__file__), "replays")
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset_replays.pkl")
+
+N_WORKERS = 4    # boxcars_py is a Rust extension -- separate processes sidestep the GIL entirely
+SAVE_EVERY = 500  # replays between checkpoint saves -- an interruption loses at most this many
 
 BALL_CLASS = "Archetypes.Ball.Ball_Default"
 CAR_CLASS = "Archetypes.Car.Car_Default"
@@ -290,6 +294,40 @@ def _extract_replay(path: str) -> tuple:
     return _extract_from_parsed(replay)
 
 
+def _extract_replay_safe(path: str) -> tuple:
+    """Pool worker wrapper. Runs in its own process, so exceptions have to come
+    back as data instead of being raised -- an uncaught one would otherwise take
+    the whole pool down over a single bad replay. Also stacks each replay's
+    per-frame vectors into one array before crossing the process boundary:
+    pickling thousands of tiny (18,)/(8,) arrays one at a time is far slower than
+    pickling two big ones.
+    """
+    try:
+        states, actions = _extract_replay(path)
+    except Exception as e:
+        return path, None, None, str(e)
+
+    if not states:
+        return path, None, None, None
+
+    return path, np.stack(states).astype(np.float32), np.stack(actions).astype(np.float32), None
+
+
+def _save_dataset(state_chunks: list, action_chunks: list, parsed: int):
+    states_arr = np.concatenate(state_chunks).astype(np.float32)
+    actions_arr = np.concatenate(action_chunks).astype(np.float32)
+
+    # Write to a temp file and rename into place -- getting interrupted mid-write
+    # would otherwise leave a half-written, corrupt dataset_replays.pkl instead of
+    # the last good checkpoint, which defeats the entire point of saving early.
+    tmp_path = DATASET_PATH + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump({"states": states_arr, "actions": actions_arr, "n_replays": parsed}, f)
+    os.replace(tmp_path, DATASET_PATH)
+
+    return len(states_arr)
+
+
 def parse_all():
     paths = sorted(glob.glob(os.path.join(REPLAYS_DIR, "*.replay")))
     if not paths:
@@ -297,32 +335,39 @@ def parse_all():
             f"No .replay files in {REPLAYS_DIR} -- run `make rl-download` first."
         )
 
-    all_states, all_actions = [], []
+    state_chunks, action_chunks = [], []
     parsed = 0
-    for i, path in enumerate(paths, 1):
-        try:
-            states, actions = _extract_replay(path)
-        except Exception as e:
-            print(f"\n  skipping {os.path.basename(path)}: {e}")
-            continue
-        if not states:
-            print(f"\n  skipping {os.path.basename(path)}: no usable frames extracted")
-            continue
-        all_states.extend(states)
-        all_actions.extend(actions)
-        parsed += 1
-        print(f"\r{i}/{len(paths)} replays parsed ({len(all_states)} frames so far)", end="", flush=True)
+    since_last_save = 0
+    frames_so_far = 0
 
-    if not all_states:
+    with multiprocessing.Pool(processes=N_WORKERS) as pool:
+        for i, (path, states_arr, actions_arr, error) in enumerate(
+            pool.imap_unordered(_extract_replay_safe, paths), 1
+        ):
+            if error is not None:
+                print(f"\n  skipping {os.path.basename(path)}: {error}")
+                continue
+            if states_arr is None:
+                print(f"\n  skipping {os.path.basename(path)}: no usable frames extracted")
+                continue
+
+            state_chunks.append(states_arr)
+            action_chunks.append(actions_arr)
+            frames_so_far += len(states_arr)
+            parsed += 1
+            since_last_save += 1
+            print(f"\r{i}/{len(paths)} replays parsed ({frames_so_far} frames so far)", end="", flush=True)
+
+            if since_last_save >= SAVE_EVERY:
+                _save_dataset(state_chunks, action_chunks, parsed)
+                since_last_save = 0
+                print(f"\n  checkpoint saved ({parsed} replays, {frames_so_far} frames) -> {DATASET_PATH}")
+
+    if not state_chunks:
         raise RuntimeError("No frames extracted from any replay -- nothing to save.")
 
-    states_arr = np.stack(all_states).astype(np.float32)
-    actions_arr = np.stack(all_actions).astype(np.float32)
-
-    with open(DATASET_PATH, "wb") as f:
-        pickle.dump({"states": states_arr, "actions": actions_arr, "n_replays": parsed}, f)
-
-    print(f"\n{len(states_arr)} frames extracted from {parsed} replay(s) -> {DATASET_PATH}")
+    total_frames = _save_dataset(state_chunks, action_chunks, parsed)
+    print(f"\n{total_frames} frames extracted from {parsed} replay(s) -> {DATASET_PATH}")
 
 
 def _synthetic_replay() -> dict:
