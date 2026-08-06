@@ -82,11 +82,17 @@ def make_dataloaders(data_dir: str = DATA_DIR, batch_size: int = 256, val_split:
     return train_loader, val_loader
 
 
-def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0):
+def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0, max_frames: int | None = None):
     """Same split logic as load_datasets, but for parse_replays.py's single
     consolidated dataset_replays.pkl instead of many session_*.pkl files --
     replay states already go through AshbyObsBuilder's own scaling (see
-    parse_replays.py), so the same CLIP_RANGE outlier guard applies as-is."""
+    parse_replays.py), so the same CLIP_RANGE outlier guard applies as-is.
+
+    max_frames randomly subsamples down to that many rows (uniformly, no
+    replacement) when the dataset has more -- at 127.98M frames the full
+    dataset alone is well over 10GB in memory, which starts fighting the OS
+    for RAM and slows everything down, not just the DataLoader.
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"No dataset at {path} -- run `make rl-parse` (or parse_replays.py "
@@ -95,8 +101,22 @@ def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0):
 
     with open(path, "rb") as f:
         data = pickle.load(f)
-    states = np.clip(data["states"].astype(np.float32), -CLIP_RANGE, CLIP_RANGE)
-    actions = data["actions"].astype(np.float32)
+    states = data["states"]
+    actions = data["actions"]
+    total_frames = len(states)
+    n_replays = data.get("n_replays", "?")
+
+    if max_frames is not None and total_frames > max_frames:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(total_frames, size=max_frames, replace=False)
+        states = states[idx]
+        actions = actions[idx]
+        print(f"  subsampled {max_frames} of {total_frames} frames (RAM guard)")
+
+    del data  # drop the last reference to the pre-subsample arrays so they can be freed
+
+    states = np.clip(states.astype(np.float32), -CLIP_RANGE, CLIP_RANGE)
+    actions = actions.astype(np.float32)
 
     full = ImitationDataset(states, actions)
     n_val = max(1, int(len(full) * val_split))
@@ -104,12 +124,35 @@ def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0):
 
     generator = torch.Generator().manual_seed(seed)
     train_set, val_set = random_split(full, [n_train, n_val], generator=generator)
-    print(f"  total frames: {len(full)} from {data.get('n_replays', '?')} replay(s)  (train {n_train} / val {n_val})")
+    print(f"  total frames: {len(full)} from {n_replays} replay(s)  (train {n_train} / val {n_val})")
     return train_set, val_set
 
 
-def make_replay_dataloaders(path: str, batch_size: int = 256, val_split: float = 0.2, seed: int = 0):
-    train_set, val_set = load_replay_dataset(path, val_split, seed)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+def make_replay_dataloaders(
+    path: str,
+    batch_size: int = 256,
+    val_split: float = 0.2,
+    seed: int = 0,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    max_frames: int | None = None,
+):
+    # dataset_replays.pkl is big enough (127.98M frames as of last parse) that
+    # CPU->GPU transfer, not compute, is the bottleneck on a 4060 -- pin_memory
+    # speeds up the actual H2D copy. num_workers defaults to 0 on purpose:
+    # ImitationDataset.__getitem__ does no real per-sample CPU work (it just
+    # indexes an already-loaded in-memory tensor), so workers have nothing to
+    # overlap with the GPU, and on Windows (no fork) each worker has to
+    # reconstruct this multi-GB in-memory dataset via spawn -- measured ~150s of
+    # pure overhead per epoch for zero benefit. Override if a future dataset
+    # actually does per-sample work worth parallelizing.
+    train_set, val_set = load_replay_dataset(path, val_split, seed, max_frames)
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+    )
     return train_loader, val_loader
