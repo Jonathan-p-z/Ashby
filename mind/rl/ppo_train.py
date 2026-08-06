@@ -29,12 +29,13 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 import torch
 
 from rlgym_ppo import Learner
+from rlgym_ppo.util import MetricsLogger
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import make_env, WEIGHTS_DIR, STATE_SIZE, ACTION_SIZE
 
 N_PROC = 4
-TIMESTEP_LIMIT = 50_000_000
+TIMESTEP_LIMIT = 200_000_000
 SAVE_EVERY_TS = 1_000_000  # a few checkpoints across the run, not just one at the very end
 
 CHECKPOINTS_DIR = os.path.join(WEIGHTS_DIR, "ppo")
@@ -43,6 +44,22 @@ IMITATION_WEIGHTS = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 # Deliberately matched to ImitationNet's hidden trunk (env.py's imitation.py: 18->256->256->8)
 # instead of rlgym-ppo's own default (256, 256, 256) -- see _load_imitation_into_policy for why.
 POLICY_LAYER_SIZES = (256, 256)
+
+# Entropy plateaued at ~0.50-0.55 after 200M steps instead of dropping as the policy
+# converges -- a flat ent_coef rewards exploration at the same rate for the entire run,
+# so nothing ever pushes the policy to commit to a behavior once it's found a decent
+# one. 0.005 is rlgym-ppo's own default (NOT the 0.01 originally assumed here -- this
+# run never overrode ppo_ent_coef, so it's been training at the library default the
+# whole time; verified via Learner.__init__'s actual signature).
+ENT_COEF_START = 0.005
+ENT_COEF_END = 0.001
+
+# policy_lr has likewise been sitting at rlgym-ppo's default (0.0003) for the entire
+# run -- decaying it the same way (same linear schedule, same 10x reduction as the
+# entropy coefficient) should help the policy settle rather than keep taking
+# full-sized steps this late into training.
+POLICY_LR_START = 0.0003
+POLICY_LR_END = 0.00003
 
 
 def _create_env():
@@ -84,11 +101,59 @@ def _load_imitation_into_policy(policy: torch.nn.Module, weights_path: str, devi
     policy.load_state_dict(policy_state)
 
 
+class _EntropyLRSchedule(MetricsLogger):
+    """Linearly decays ppo_ent_coef and the policy's learning rate over the run.
+
+    rlgym-ppo has no built-in scheduling and Learner.learn() is a single blocking
+    call with no per-iteration callback of its own -- MetricsLogger is the one hook
+    it actually exposes (Learner calls report_metrics once per iteration, passing
+    cumulative_timesteps), so this rides that instead of patching library source.
+
+    Both targets are read fresh on every PPO update, not captured once at
+    construction (see ppo_learner.py's learn(): `entropy * self.ent_coef`, and
+    Adam reads param_groups[i]['lr'] on every .step()) -- so mutating them here
+    between iterations genuinely changes the next update, not just bookkeeping.
+
+    report_metrics is overridden directly rather than _report_metrics: the base
+    class's report_metrics early-returns whenever wandb_run is None, which it
+    always is here (no W&B), so the usual override point would just never fire.
+    """
+
+    def __init__(self, timestep_limit: int, ent_coef_start: float, ent_coef_end: float,
+                 policy_lr_start: float, policy_lr_end: float):
+        self.timestep_limit = timestep_limit
+        self.ent_coef_start = ent_coef_start
+        self.ent_coef_end = ent_coef_end
+        self.policy_lr_start = policy_lr_start
+        self.policy_lr_end = policy_lr_end
+        self.learner = None  # attached after Learner(...) returns, see train()
+
+    def _collect_metrics(self, game_state):
+        return []  # nothing to gather per env step -- this logger only drives the schedule
+
+    def report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
+        if self.learner is None:
+            return  # called mid-Learner-construction, before train() attaches the back-reference
+
+        progress = min(1.0, cumulative_timesteps / self.timestep_limit)
+        ent_coef = self.ent_coef_start + (self.ent_coef_end - self.ent_coef_start) * progress
+        policy_lr = self.policy_lr_start + (self.policy_lr_end - self.policy_lr_start) * progress
+
+        self.learner.ppo_learner.ent_coef = ent_coef
+        for group in self.learner.ppo_learner.policy_optimizer.param_groups:
+            group["lr"] = policy_lr
+
+
 def train():
     print("=" * 65)
     print("  Ashby x rlgym-ppo -- PPO fine-tuning")
     print(f"  workers: {N_PROC}  |  timestep limit: {TIMESTEP_LIMIT}")
+    print(f"  ent_coef: {ENT_COEF_START} -> {ENT_COEF_END}  |  policy_lr: {POLICY_LR_START} -> {POLICY_LR_END}")
     print("=" * 65)
+
+    entropy_lr_schedule = _EntropyLRSchedule(
+        TIMESTEP_LIMIT, ENT_COEF_START, ENT_COEF_END, POLICY_LR_START, POLICY_LR_END,
+    )
 
     learner = Learner(
         env_create_function=_create_env,
@@ -98,7 +163,11 @@ def train():
         checkpoints_save_folder=CHECKPOINTS_DIR,
         add_unix_timestamp=False,  # one stable mind/weights/ppo/<timesteps>/ history, not a new folder per run
         save_every_ts=SAVE_EVERY_TS,
+        metrics_logger=entropy_lr_schedule,
     )
+    entropy_lr_schedule.learner = learner  # workers already got their own pickled copy of the
+    # logger for collect_metrics by this point -- this back-reference only matters for
+    # report_metrics, which runs here in the main process, so attaching it late is safe.
 
     # cumulative_timesteps > 0 here means Learner already auto-resumed a prior PPO
     # checkpoint from CHECKPOINTS_DIR (its default "latest" behavior) -- in that case
