@@ -217,3 +217,15 @@ deltas = agent.weight_delta(snapshot)  # L2 norm of (current - snapshot)
 ```
 
 Measures how much each layer's weights actually moved during training. Used in `pretrain.py` to show which layers are most active in each environment — typically `hidden_layer` changes the most, which confirms it's the one doing real feature learning.
+
+---
+
+## rlgym-ppo instead of a custom DDPG agent
+
+The Rocket League environment (`mind/rl/`, see [docs/rocket_league.md](rocket_league.md) for the full pipeline) started with a DDPG agent (`rl_agent.py`) built the same way as `dqn_agent.py`/`transfer_agent.py` above: actor-critic pair, replay buffer, target networks. That choice matched the rest of the codebase, but ran into a problem specific to fine-tuning *from* pretrained weights rather than training from scratch.
+
+**The problem:** DDPG's actor update, `actor_loss = -critic(s, actor(s)).mean()`, has no constraint on how far a single gradient step can move the actor — it's pushed directly toward whatever the critic currently rates highest. A freshly-initialized critic is close to random. The very first actor-update step then drags an imitation-pretrained actor toward whatever that random critic happens to prefer, overwriting the pretraining before real reinforcement learning ever gets a chance to build on it (catastrophic forgetting). Two mitigations were added directly to `rl_agent.py` — bootstrapping the critic against a cheap reward estimate before any real RL step, and lowering the fine-tuning learning rate — but both are damage control for a structural property of the algorithm, not a fix for it.
+
+**Why PPO instead:** PPO's clipped surrogate objective bounds how far a single policy update is allowed to move, by construction, regardless of how the value function happens to be initialized. That makes it robust to fine-tuning from a pretrained starting point in a way DDPG structurally isn't. [rlgym-ppo](https://github.com/AechPro/rlgym-ppo) is a ready-made, actively maintained PPO implementation built specifically for RLGym-style environments — adopting it also replaced `rl_train.py`'s hand-rolled multi-process worker/queue/self-play-pool plumbing with rlgym-ppo's own `Learner` and its built-in multi-process rollout collection, removing a whole layer of custom infrastructure that existed only to work around problems PPO (and a mature training library) doesn't have.
+
+This is the one place in the project where a custom from-scratch agent was deliberately replaced with a library implementation, rather than the other direction (every other agent here — tabular Q, DQN, TransferAgent — is intentionally built from first principles). The justification is specific: DDPG's instability when fine-tuning from imitation weights is a known, structural issue with off-policy actor-critic methods, not something a from-scratch reimplementation would meaningfully do better at than a well-tested on-policy library already built to avoid it.

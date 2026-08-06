@@ -108,9 +108,50 @@ make vizdoom-transfer     # benchmark scratch vs transfer between scenarios
 
 ---
 
+## Rocket League (RLGym)
+
+Beyond simulated grids and ViZDoom, Ashby also trains on real Rocket League — via [RLGym](https://rlgym.org/)/RocketSim for fast simulated self-play, real ranked replays for behavioral cloning, and RLBot to actually play a real match. Full writeup, including the bugs that shaped the replay parser: [docs/rocket_league.md](docs/rocket_league.md).
+
+```
+ballchasing.com replays  →  boxcars_py parser  →  behavioral cloning  →  PPO fine-tuning (rlgym-ppo)  →  RLBot (real game)
+   11,259 downloaded          6,000 parsed OK        ImitationNet            self-play, 200M steps         real 1v1 match
+                               127.98M frames         18 → 256 → 256 → 8      imitation-seeded policy
+```
+
+| Stage | Result |
+|---|---|
+| Replays downloaded | 11,259 (ballchasing.com, ranked 1v1, diamond-1+) |
+| Replays parsed successfully | 6,000 (rest hit an unrecoverable replay-format bug — see docs) |
+| Training frames | 127,980,513 |
+| Behavioral cloning | ~0.085 MSE final validation loss |
+| PPO fine-tuning | 200,000,000 steps, reward climbing to the mid-teens, peaking around +18 |
+
+![Behavioral cloning training curve](mind/rl_imitation_results.png)
+
+*Train/val MSE loss for the behavioral-cloning run above (~0.085 final). Single-epoch config means this renders as a single, effectively invisible point rather than a curve — see [docs/rocket_league.md](docs/rocket_league.md#behavioral-cloning) for why.*
+
+**DDPG, then PPO.** RL fine-tuning originally used DDPG, matching this project's other from-scratch agents. DDPG's actor update has no brakes on how far one gradient step can move the policy, so the first update after loading imitation-pretrained weights dragged them toward whatever a still-random critic preferred — undoing the pretraining (catastrophic forgetting). PPO's clipped objective doesn't have that failure mode, so `ppo_train.py` (via [rlgym-ppo](https://github.com/AechPro/rlgym-ppo)) replaced the DDPG pipeline for RL training entirely. Reasoning in full: [docs/architecture.md](docs/architecture.md#rlgym-ppo-instead-of-a-custom-ddpg-agent).
+
+![DDPG self-play training history](mind/rl_training_results.png)
+
+*3,000 episodes of the superseded DDPG self-play run — touch rate and goal differential both stay flat and noisy for the whole run, part of why PPO replaced it.*
+
+**Being honest about where this stands.** The reward curve is a real success. But policy entropy plateaued around 0.50-0.55 and never dropped the way a converging policy's should, and that shows up in real matches: Ashby's play imitates recognizable pieces of Rocket League — approaching the ball, adjusting position — without them reliably chaining into coherent, decisive sequences. An entropy-coefficient and learning-rate decay is implemented and mechanically verified, but whether it actually fixes the plateau hasn't been confirmed by a full run yet. This isn't downplayed relative to the reward number above — both are real, and worth weighing equally.
+
+```bash
+make rl-download    # download ranked replays from ballchasing.com (needs BALLCHASING_TOKEN)
+make rl-parse       # parse downloaded replays into a behavioral-cloning dataset
+make rl-train-bc    # behavioral cloning -> rl_imitation.pth
+make rl-train-ppo   # PPO fine-tuning via rlgym-ppo -> mind/weights/ppo/
+make rl-watch       # watch the trained policy play 1v1 in RocketSim
+make rl-rlbot       # point the RLBot GUI at Ashby for a real Rocket League match
+```
+
+---
+
 ## Getting started
 
-**Prerequisites:** Rust (stable), Python 3.12, `cargo`
+**Prerequisites:** Rust (stable), Python 3.12, `cargo`. For real-match Rocket League play: [RLBot v2](https://rlbot.org/) and Rocket League itself (only needed for `make rl-rlbot` / `mind/rl/run_match.py` — everything else trains against RocketSim, no game install required).
 
 ```bash
 git clone <repo>
@@ -177,18 +218,37 @@ Ashby/
 │   ├── eval.py                 # evaluation table across all environments
 │   ├── pretrain.py             # sequential pretraining, saves mind/weights/*.pth
 │   ├── benchmark.py            # scratch vs transfer benchmark, generates transfer_benchmark.png
-│   └── weights/                # pretrained checkpoints (created by make pretrain)
-│       ├── gridworld.pth
-│       ├── frozen_lake.pth
-│       ├── predator_grid.pth
-│       ├── maze_world.pth
-│       └── resource_hunter.pth
+│   ├── weights/                # pretrained checkpoints (created by make pretrain)
+│   │   ├── gridworld.pth
+│   │   ├── frozen_lake.pth
+│   │   ├── predator_grid.pth
+│   │   ├── maze_world.pth
+│   │   ├── resource_hunter.pth
+│   │   ├── rl_imitation.pth    # behavioral-cloning weights (imitation.py)
+│   │   ├── rl_policy.pth       # DDPG weights, superseded by ppo/ (kept as a fallback)
+│   │   └── ppo/                # rlgym-ppo checkpoints, one numbered folder per save
+│   │
+│   └── rl/                     # Rocket League — see docs/rocket_league.md
+│       ├── env.py                 # AshbyObsBuilder, AshbyReward, make_env() -- shared by every script below
+│       ├── download_replays.py    # ballchasing.com replay downloader
+│       ├── parse_replays.py       # boxcars_py -> dataset_replays.pkl
+│       ├── dataset.py             # dataset_replays.pkl / session_*.pkl -> DataLoaders
+│       ├── imitation.py           # behavioral cloning -> rl_imitation.pth
+│       ├── rl_agent.py            # DDPG actor-critic (superseded by ppo_train.py)
+│       ├── rl_train.py            # DDPG training loop (superseded by ppo_train.py)
+│       ├── ppo_train.py           # PPO fine-tuning via rlgym-ppo -> mind/weights/ppo/
+│       ├── record.py              # play 1v1 vs Ashby with a gamepad, log (state, action) pairs
+│       ├── watch.py                # watch the trained RocketSim policy play 1v1
+│       ├── rlbot.toml              # RLBot v2 bot config, points at rlbot_agent.py
+│       ├── rlbot_agent.py         # RLBot v2 wrapper -- Ashby in a real Rocket League match
+│       └── run_match.py           # automated you-vs-Ashby match via RLBot, live stats
 │
 └── docs/
     ├── environments.md         # per-environment design decisions and mechanics
     ├── transfer_learning.md    # how transfer works here, why the results look like they do
-    ├── architecture.md         # Rust trait, PyO3 bridge, DQN, TransferAgent internals
-    └── results.md              # all plots, tables, and what the curves tell you
+    ├── architecture.md         # Rust trait, PyO3 bridge, DQN, TransferAgent, rlgym-ppo internals
+    ├── results.md              # all plots, tables, and what the curves tell you
+    └── rocket_league.md        # replay pipeline, behavioral cloning, DDPG->PPO, RLBot
 ```
 
 ---

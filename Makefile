@@ -88,7 +88,7 @@ run: build pretrain benchmark
 # Python is always available after setup — use it instead of shell-specific stat commands
 docs:
 	@echo "Checking documentation files..."
-	@$(PYTHON) -c "import sys,os; files=['README.md','CONTRIBUTING.md','docs/environments.md','docs/transfer_learning.md','docs/architecture.md','docs/results.md']; [print('  ok:',f) if os.path.isfile(f) and os.path.getsize(f)>0 else sys.exit('  MISSING or empty: '+f) for f in files]; print('All documentation files present.')"
+	@$(PYTHON) -c "import sys,os; files=['README.md','CONTRIBUTING.md','docs/environments.md','docs/transfer_learning.md','docs/architecture.md','docs/results.md','docs/rocket_league.md']; [print('  ok:',f) if os.path.isfile(f) and os.path.getsize(f)>0 else sys.exit('  MISSING or empty: '+f) for f in files]; print('All documentation files present.')"
 
 vizdoom-train:
 	@echo "Training ViZDoom agent (headless, 1000 episodes)..."
