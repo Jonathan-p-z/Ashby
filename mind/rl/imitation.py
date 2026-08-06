@@ -31,13 +31,15 @@ from parse_replays import DATASET_PATH
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "rl_imitation_results.png")
 
-N_EPOCHS = 3  # dataset_replays.pkl runs ~40M frames -- a handful of passes already
-              # sees far more (state, action) pairs than 100 epochs of a hand-played
-              # session ever would; more than that mostly just burns GPU time.
-BATCH_SIZE = 256
+N_EPOCHS = 1  # dataset_replays.pkl runs 127.98M frames -- at batch 1024 that's already
+              # ~100k steps in a single pass, far more (state, action) pairs than 100
+              # epochs of a hand-played session ever would; more than 1 mostly just
+              # burns GPU time on this volume of data.
+BATCH_SIZE = 1024
 LEARNING_RATE = 0.001
-REPORT_EVERY = 1  # only 3 epochs total now -- report every one of them
+REPORT_EVERY = 1  # only 1 epoch total now -- report it
 LOSS_REPORT_STEPS = 1000
+MAX_FRAMES = 50_000_000  # the full 127.98M frames alone is 10GB+ in memory -- caps RAM pressure
 
 
 class ImitationNet(nn.Module):
@@ -88,7 +90,16 @@ def train():
     print("=" * 65)
 
     print("\nLoading parsed replay dataset...")
-    train_loader, val_loader = make_replay_dataloaders(DATASET_PATH, batch_size=BATCH_SIZE)
+    # CPU->GPU transfer is the bottleneck here, not compute -- pin_memory speeds up
+    # the actual H2D copy. num_workers stays 0: ImitationDataset.__getitem__ just
+    # indexes an already-loaded in-memory tensor, no real per-sample CPU work for
+    # workers to overlap with the GPU, and on Windows (no fork) each worker has to
+    # reconstruct this ~13GB in-memory dataset via spawn -- measured ~150s of pure
+    # overhead per epoch for zero benefit.
+    train_loader, val_loader = make_replay_dataloaders(
+        DATASET_PATH, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True,
+        max_frames=MAX_FRAMES,
+    )
 
     model = ImitationNet().to(DEVICE)
     criterion = nn.MSELoss()
