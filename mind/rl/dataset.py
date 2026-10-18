@@ -12,6 +12,7 @@ weights are transferring a lie.
 
 import os
 import glob
+import json
 import pickle
 
 import numpy as np
@@ -83,40 +84,99 @@ def make_dataloaders(data_dir: str = DATA_DIR, batch_size: int = 256, val_split:
 
 
 def load_replay_dataset(path: str, val_split: float = 0.2, seed: int = 0, max_frames: int | None = None):
-    """Same split logic as load_datasets, but for parse_replays.py's single
-    consolidated dataset_replays.pkl instead of many session_*.pkl files --
-    replay states already go through AshbyObsBuilder's own scaling (see
+    """Same split logic as load_datasets, but for parse_replays.py's replay dataset
+    -- replay states already go through AshbyObsBuilder's own scaling (see
     parse_replays.py), so the same CLIP_RANGE outlier guard applies as-is.
 
-    max_frames randomly subsamples down to that many rows (uniformly, no
-    replacement) when the dataset has more -- at 127.98M frames the full
-    dataset alone is well over 10GB in memory, which starts fighting the OS
-    for RAM and slows everything down, not just the DataLoader.
+    `path` is a directory (parse_replays.py's DATASET_DIR): a manifest.json plus
+    shard_NNNNN.pkl files, not one monolithic pickle. That split exists because a
+    single-file dataset means loading it means holding the whole thing in memory
+    twice, however large it's grown to -- once as whatever np.concatenate needs to
+    read from, once as the array it produces. Shards let both this function and
+    parse_replays.py's writer avoid that: only load what's actually needed, and
+    never hold more than one shard's extra copy in memory at a time.
+
+    max_frames randomly subsamples down to that many rows when the dataset has
+    more -- at 127.98M+ frames the full dataset is well over 10GB in memory,
+    which starts fighting the OS for RAM and slows down everything, not just the
+    DataLoader. When set, only the shards actually needed to reach max_frames are
+    ever opened -- the rest are never loaded at all.
     """
-    if not os.path.isfile(path):
+    manifest_path = os.path.join(path, "manifest.json")
+    if not os.path.isfile(manifest_path):
         raise FileNotFoundError(
-            f"No dataset at {path} -- run `make rl-parse` (or parse_replays.py "
-            "directly) to build it from downloaded replays first."
+            f"No dataset manifest at {manifest_path} -- run `make rl-parse` (or "
+            "parse_replays.py directly) to build it from downloaded replays first."
         )
 
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    states = data["states"]
-    actions = data["actions"]
-    total_frames = len(states)
-    n_replays = data.get("n_replays", "?")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    shards = manifest["shards"]
+    total_frames = manifest["n_frames"]
+    n_replays = manifest.get("n_replays", "?")
+    if not shards:
+        raise RuntimeError(f"Dataset manifest at {manifest_path} lists no shards.")
+
+    rng = np.random.default_rng(seed)
 
     if max_frames is not None and total_frames > max_frames:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(total_frames, size=max_frames, replace=False)
-        states = states[idx]
-        actions = actions[idx]
-        print(f"  subsampled {max_frames} of {total_frames} frames (RAM guard)")
+        # Pick whole shards, in random order, until their frames cover max_frames --
+        # shards are ~500-replay batches assembled from imap_unordered completion
+        # order (not correlated with any replay's own characteristics), so this is
+        # a close approximation of true frame-level uniform sampling without ever
+        # opening shards that aren't needed.
+        order = rng.permutation(len(shards))
+        selected, running = [], 0
+        for shard_idx in order:
+            selected.append(shards[shard_idx])
+            running += shards[shard_idx]["n_frames"]
+            if running >= max_frames:
+                break
 
-    del data  # drop the last reference to the pre-subsample arrays so they can be freed
+        state_parts, action_parts = [], []
+        for shard in selected:
+            with open(os.path.join(path, shard["file"]), "rb") as f:
+                shard_data = pickle.load(f)
+            state_parts.append(shard_data["states"])
+            action_parts.append(shard_data["actions"])
+            del shard_data
 
-    states = np.clip(states.astype(np.float32), -CLIP_RANGE, CLIP_RANGE)
-    actions = actions.astype(np.float32)
+        states = np.concatenate(state_parts)
+        actions = np.concatenate(action_parts)
+        del state_parts, action_parts
+
+        if len(states) > max_frames:
+            idx = rng.choice(len(states), size=max_frames, replace=False)
+            states = states[idx]
+            actions = actions[idx]
+
+        print(f"  loaded {len(selected)}/{len(shards)} shard(s), subsampled to {len(states)} of {total_frames} frames (RAM guard)")
+    else:
+        # Loading everything -- preallocate the destination once and fill it shard by
+        # shard instead of np.concatenate-ing a list of per-shard arrays, so peak
+        # memory is "one destination array + one shard" rather than "every shard
+        # held at once, plus a second copy for the concatenated result".
+        states = None
+        actions = None
+        offset = 0
+        for shard in shards:
+            with open(os.path.join(path, shard["file"]), "rb") as f:
+                shard_data = pickle.load(f)
+            shard_states = shard_data["states"]
+            shard_actions = shard_data["actions"]
+            if states is None:
+                states = np.empty((total_frames, shard_states.shape[1]), dtype=np.float32)
+                actions = np.empty((total_frames, shard_actions.shape[1]), dtype=np.float32)
+            n = len(shard_states)
+            states[offset:offset + n] = shard_states
+            actions[offset:offset + n] = shard_actions
+            offset += n
+            del shard_data, shard_states, shard_actions
+
+        print(f"  loaded all {len(shards)} shard(s), {total_frames} frames (no subsampling)")
+
+    states = np.clip(states.astype(np.float32, copy=False), -CLIP_RANGE, CLIP_RANGE)
+    actions = actions.astype(np.float32, copy=False)
 
     full = ImitationDataset(states, actions)
     n_val = max(1, int(len(full) * val_split))
@@ -137,7 +197,7 @@ def make_replay_dataloaders(
     pin_memory: bool = True,
     max_frames: int | None = None,
 ):
-    # dataset_replays.pkl is big enough (127.98M frames as of last parse) that
+    # The replay dataset is big enough (127.98M+ frames as of last parse) that
     # CPU->GPU transfer, not compute, is the bottleneck on a 4060 -- pin_memory
     # speeds up the actual H2D copy. num_workers defaults to 0 on purpose:
     # ImitationDataset.__getitem__ does no real per-sample CPU work (it just
