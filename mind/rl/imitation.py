@@ -26,7 +26,7 @@ import torch.optim as optim
 sys.path.insert(0, os.path.dirname(__file__))
 from env import STATE_SIZE, ACTION_SIZE, DEVICE, WEIGHTS_DIR
 from dataset import make_replay_dataloaders
-from parse_replays import DATASET_PATH
+from parse_replays import DATASET_DIR
 
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "rl_imitation.pth")
 RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "rl_imitation_results.png")
@@ -97,7 +97,7 @@ def train():
     # reconstruct this ~13GB in-memory dataset via spawn -- measured ~150s of pure
     # overhead per epoch for zero benefit.
     train_loader, val_loader = make_replay_dataloaders(
-        DATASET_PATH, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True,
+        DATASET_DIR, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True,
         max_frames=MAX_FRAMES,
     )
 
