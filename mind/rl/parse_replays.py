@@ -34,6 +34,7 @@ version:
 
 import os
 import glob
+import json
 import pickle
 import argparse
 import multiprocessing
@@ -46,10 +47,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 from env import STATE_SIZE, ACTION_SIZE, POS_COEF, VEL_COEF, common_values
 
 REPLAYS_DIR = os.path.join(os.path.dirname(__file__), "replays")
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset_replays.pkl")
+
+# A directory of shard_NNNNN.pkl files plus a manifest.json, not one monolithic
+# pickle -- see _write_shard for why. dataset.py's load_replay_dataset reads this
+# same directory format.
+DATASET_DIR = os.path.join(os.path.dirname(__file__), "dataset_replays")
+MANIFEST_PATH = os.path.join(DATASET_DIR, "manifest.json")
 
 N_WORKERS = 4    # boxcars_py is a Rust extension -- separate processes sidestep the GIL entirely
-SAVE_EVERY = 500  # replays between checkpoint saves -- an interruption loses at most this many
+SAVE_EVERY = 500  # replays per shard/checkpoint -- an interruption loses at most this many
 
 BALL_CLASS = "Archetypes.Ball.Ball_Default"
 CAR_CLASS = "Archetypes.Car.Car_Default"
@@ -313,19 +319,39 @@ def _extract_replay_safe(path: str) -> tuple:
     return path, np.stack(states).astype(np.float32), np.stack(actions).astype(np.float32), None
 
 
-def _save_dataset(state_chunks: list, action_chunks: list, parsed: int):
+def _write_shard(dataset_dir: str, shard_index: int, state_chunks: list, action_chunks: list) -> tuple:
+    """Writes one batch of already-parsed replays as its own shard file and never
+    touches previously-written shards.
+
+    The old version re-concatenated *every* replay parsed so far, on *every*
+    checkpoint -- state_chunks/action_chunks grew for the whole run, so by
+    replay 10,000 each checkpoint was briefly holding both the full growing
+    list AND a freshly np.concatenate'd copy of it at once. That's exactly what
+    crashed with a MemoryError at 95M and 139M frames. Concatenating only the
+    current batch (bounded by SAVE_EVERY, ~500 replays) keeps peak memory
+    roughly constant regardless of how large the overall dataset gets --
+    parse_all() drops its reference to the batch right after this call, which
+    is what actually frees the memory.
+    """
     states_arr = np.concatenate(state_chunks).astype(np.float32)
     actions_arr = np.concatenate(action_chunks).astype(np.float32)
 
-    # Write to a temp file and rename into place -- getting interrupted mid-write
-    # would otherwise leave a half-written, corrupt dataset_replays.pkl instead of
-    # the last good checkpoint, which defeats the entire point of saving early.
-    tmp_path = DATASET_PATH + ".tmp"
+    shard_name = f"shard_{shard_index:05d}.pkl"
+    shard_path = os.path.join(dataset_dir, shard_name)
+    tmp_path = shard_path + ".tmp"
     with open(tmp_path, "wb") as f:
-        pickle.dump({"states": states_arr, "actions": actions_arr, "n_replays": parsed}, f)
-    os.replace(tmp_path, DATASET_PATH)
+        pickle.dump({"states": states_arr, "actions": actions_arr}, f)
+    os.replace(tmp_path, shard_path)
 
-    return len(states_arr)
+    return shard_name, len(states_arr)
+
+
+def _write_manifest(dataset_dir: str, shards: list, n_replays: int, n_frames: int):
+    manifest = {"n_replays": n_replays, "n_frames": n_frames, "shards": shards}
+    tmp_path = MANIFEST_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, MANIFEST_PATH)
 
 
 def parse_all():
@@ -335,7 +361,11 @@ def parse_all():
             f"No .replay files in {REPLAYS_DIR} -- run `make rl-download` first."
         )
 
-    state_chunks, action_chunks = [], []
+    os.makedirs(DATASET_DIR, exist_ok=True)
+
+    batch_states, batch_actions = [], []
+    shards = []
+    shard_index = 0
     parsed = 0
     since_last_save = 0
     frames_so_far = 0
@@ -351,23 +381,31 @@ def parse_all():
                 print(f"\n  skipping {os.path.basename(path)}: no usable frames extracted")
                 continue
 
-            state_chunks.append(states_arr)
-            action_chunks.append(actions_arr)
+            batch_states.append(states_arr)
+            batch_actions.append(actions_arr)
             frames_so_far += len(states_arr)
             parsed += 1
             since_last_save += 1
             print(f"\r{i}/{len(paths)} replays parsed ({frames_so_far} frames so far)", end="", flush=True)
 
             if since_last_save >= SAVE_EVERY:
-                _save_dataset(state_chunks, action_chunks, parsed)
+                shard_name, shard_frames = _write_shard(DATASET_DIR, shard_index, batch_states, batch_actions)
+                shards.append({"file": shard_name, "n_frames": shard_frames})
+                _write_manifest(DATASET_DIR, shards, parsed, frames_so_far)
+                shard_index += 1
+                batch_states, batch_actions = [], []  # drop the flushed batch -- this is what frees the memory
                 since_last_save = 0
-                print(f"\n  checkpoint saved ({parsed} replays, {frames_so_far} frames) -> {DATASET_PATH}")
+                print(f"\n  checkpoint saved (shard {shard_index}, {parsed} replays, {frames_so_far} frames so far) -> {DATASET_DIR}")
 
-    if not state_chunks:
+    if not shards and not batch_states:
         raise RuntimeError("No frames extracted from any replay -- nothing to save.")
 
-    total_frames = _save_dataset(state_chunks, action_chunks, parsed)
-    print(f"\n{total_frames} frames extracted from {parsed} replay(s) -> {DATASET_PATH}")
+    if batch_states:
+        shard_name, shard_frames = _write_shard(DATASET_DIR, shard_index, batch_states, batch_actions)
+        shards.append({"file": shard_name, "n_frames": shard_frames})
+
+    _write_manifest(DATASET_DIR, shards, parsed, frames_so_far)
+    print(f"\n{frames_so_far} frames extracted from {parsed} replay(s) across {len(shards)} shard(s) -> {DATASET_DIR}")
 
 
 def _synthetic_replay() -> dict:
