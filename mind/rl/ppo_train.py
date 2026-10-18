@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from env import make_env, WEIGHTS_DIR, STATE_SIZE, ACTION_SIZE
 
 N_PROC = 4
-TIMESTEP_LIMIT = 200_000_000
+TIMESTEP_LIMIT = 400_000_000
 SAVE_EVERY_TS = 1_000_000  # a few checkpoints across the run, not just one at the very end
 
 CHECKPOINTS_DIR = os.path.join(WEIGHTS_DIR, "ppo")
